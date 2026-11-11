@@ -1,0 +1,405 @@
+"""Unit and integration tests for PyQt5 GUI application."""
+
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+# Force Qt offscreen platform before creating any widgets
+os.environ["QT_QPA_PLATFORM"] = "offscreen"
+
+from vn_pdf_to_docx.gui import (
+    ConversionWorker,
+    MainWindow,
+    save_key_to_dotenv,
+)
+from PyQt5.QtCore import Qt
+from PyQt5.QtWidgets import QApplication
+
+# Shared QApplication instance
+_app = QApplication.instance()
+if _app is None:
+    _app = QApplication(["--platform", "offscreen"])
+
+
+def _create_minimal_pdf(file_path: Path) -> None:
+    """Create a minimal 2-page PDF file for testing."""
+    try:
+        import pymupdf as fitz
+    except ImportError:
+        import fitz
+
+    doc = fitz.open()
+    page1 = doc.new_page(width=595, height=842)
+    page1.insert_text((50, 100), "CỘNG HÒA XÃ HỘI CHỦ NGHĨA VIỆT NAM")
+    page2 = doc.new_page(width=595, height=842)
+    page2.insert_text((50, 100), "Nơi nhận: Văn phòng Chính phủ")
+    doc.save(str(file_path))
+    doc.close()
+
+
+class TestSaveKeyToDotEnv(unittest.TestCase):
+    def test_save_key_creates_and_updates_dotenv(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(tmp_dir)
+                save_key_to_dotenv("test_key_123", "gemini-2.5-flash")
+                env_path = Path(".env")
+                self.assertTrue(env_path.exists())
+                content = env_path.read_text(encoding="utf-8")
+                self.assertIn("GEMINI_API_KEY=test_key_123", content)
+                self.assertIn("GEMINI_MODEL=gemini-2.5-flash", content)
+
+                # Update key
+                save_key_to_dotenv("test_key_456", "gemini-3.5-flash")
+                content2 = env_path.read_text(encoding="utf-8")
+                self.assertIn("GEMINI_API_KEY=test_key_456", content2)
+                self.assertIn("GEMINI_MODEL=gemini-3.5-flash", content2)
+                self.assertNotIn("test_key_123", content2)
+            finally:
+                os.chdir(old_cwd)
+
+
+class TestMainWindow(unittest.TestCase):
+    def setUp(self) -> None:
+        self.window = MainWindow()
+
+    def tearDown(self) -> None:
+        self.window.worker = None
+        self.window.close()
+
+    def test_window_initial_state(self) -> None:
+        self.assertIn("Nghị định 30/2020/NĐ-CP", self.window.windowTitle())
+        self.assertTrue(self.window.rad_all_pages.isChecked())
+        self.assertFalse(self.window.txt_custom_pages.isEnabled())
+        self.assertTrue(self.window.btn_start.isEnabled())
+        self.assertFalse(self.window.btn_cancel.isEnabled())
+        self.assertFalse(self.window.btn_open_docx.isEnabled())
+        self.assertEqual(self.window.spn_dpi.value(), 200)
+        models = [self.window.cmb_model.itemText(i) for i in range(self.window.cmb_model.count())]
+        self.assertEqual(
+            models,
+            ["gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.1-flash-lite"],
+        )
+        self.assertNotIn("gemini-3.6-flash", models)
+        self.assertEqual(
+            self.window.chk_skip_llm.text(),
+            "Bỏ qua bước sửa chính tả Gemini (Chỉ dùng VietOCR Offline để xuất Word ngay)",
+        )
+        self.assertFalse(self.window.chk_skip_llm.isChecked())
+
+    def test_toggle_key_visibility(self) -> None:
+        from PyQt5.QtWidgets import QLineEdit
+
+        self.assertEqual(self.window.txt_api_key.echoMode(), QLineEdit.Password)
+        self.window._toggle_show_key()
+        self.assertEqual(self.window.txt_api_key.echoMode(), QLineEdit.Normal)
+        self.window._toggle_show_key()
+        self.assertEqual(self.window.txt_api_key.echoMode(), QLineEdit.Password)
+
+    def test_page_mode_toggle(self) -> None:
+        self.window.rad_custom_pages.setChecked(True)
+        self.assertTrue(self.window.txt_custom_pages.isEnabled())
+        self.window.rad_all_pages.setChecked(True)
+        self.assertFalse(self.window.txt_custom_pages.isEnabled())
+
+    def test_pdf_path_changed_updates_info(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pdf_path = Path(tmp_dir) / "sample_test.pdf"
+            _create_minimal_pdf(pdf_path)
+
+            self.window._on_pdf_path_changed(str(pdf_path))
+            self.assertEqual(self.window.current_pdf_total_pages, 2)
+            self.assertIn("2 trang", self.window.lbl_pdf_info.text())
+            self.assertEqual(
+                self.window.txt_docx.text(),
+                str(pdf_path.with_suffix(".docx")),
+            )
+
+    def test_start_conversion_validation_missing_pdf(self) -> None:
+        self.window.txt_pdf.setText("")
+        with patch.object(self.window, "_append_log") as mock_log, \
+             patch("PyQt5.QtWidgets.QMessageBox.warning") as mock_box:
+            self.window._start_conversion()
+            mock_box.assert_called_once()
+            self.assertIn("Thiếu tệp đầu vào", mock_box.call_args[0][1])
+
+    def test_start_conversion_validation_invalid_pages(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pdf_path = Path(tmp_dir) / "sample.pdf"
+            _create_minimal_pdf(pdf_path)
+            self.window.txt_pdf.setText(str(pdf_path))
+            self.window.rad_custom_pages.setChecked(True)
+            self.window.txt_custom_pages.setText("99-100")  # Document only has 2 pages
+            self.window.txt_api_key.setText("dummy_key")
+
+            with patch("PyQt5.QtWidgets.QMessageBox.critical") as mock_box:
+                self.window._start_conversion()
+                mock_box.assert_called_once()
+                self.assertIn("vượt quá tổng số trang", str(mock_box.call_args[0][2]))
+
+    def test_footer_alignment_setting(self) -> None:
+        self.assertEqual(self.window.cmb_footer_align.count(), 2)
+        self.assertEqual(self.window.cmb_footer_align.currentData(), "center")
+        self.window.cmb_footer_align.setCurrentIndex(1)
+        self.assertEqual(self.window.cmb_footer_align.currentData(), "left")
+
+    def test_start_conversion_ensures_docx_extension(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pdf_path = Path(tmp_dir) / "doc.pdf"
+            _create_minimal_pdf(pdf_path)
+            self.window.txt_pdf.setText(str(pdf_path))
+            self.window.txt_docx.setText(str(Path(tmp_dir) / "output_without_ext"))
+            self.window.txt_api_key.setText("dummy_key")
+
+            with patch("vn_pdf_to_docx.gui.ConversionWorker.start") as mock_start:
+                self.window._start_conversion()
+                self.assertTrue(self.window.txt_docx.text().endswith(".docx"))
+                self.assertEqual(self.window.worker.output_docx.suffix, ".docx")
+
+    def test_start_conversion_guards_against_concurrent_run(self) -> None:
+        mock_worker = MagicMock()
+        mock_worker.isRunning.return_value = True
+        self.window.worker = mock_worker
+
+        with patch("PyQt5.QtWidgets.QMessageBox.warning") as mock_box:
+            self.window._start_conversion()
+            mock_box.assert_called_once()
+            self.assertIn("Một tiến trình chuyển đổi đang chạy", mock_box.call_args[0][2])
+
+    def test_close_event_with_running_worker(self) -> None:
+        mock_worker = MagicMock()
+        mock_worker.isRunning.return_value = True
+        self.window.worker = mock_worker
+
+        # Case 1: User says No (reject close)
+        mock_event = MagicMock()
+        with patch("PyQt5.QtWidgets.QMessageBox.question", return_value=16384):  # QMessageBox.No = 65536, Yes = 16384
+            # test reject
+            with patch("PyQt5.QtWidgets.QMessageBox.question", return_value=65536):
+                self.window.closeEvent(mock_event)
+                mock_event.ignore.assert_called_once()
+                mock_worker.cancel.assert_not_called()
+
+        # Case 2: User says Yes (accept close and cancel worker)
+        mock_event2 = MagicMock()
+        with patch("PyQt5.QtWidgets.QMessageBox.question", return_value=16384):
+            self.window.closeEvent(mock_event2)
+            mock_worker.cancel.assert_called_once()
+            mock_event2.accept.assert_called_once()
+        self.window.worker = None
+
+    def test_on_worker_finished_success_and_cancel(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            out_file = Path(tmp_dir) / "res.docx"
+            out_file.write_text("dummy docx")
+
+            # Success with open Word checked
+            self.window.chk_open_word.setChecked(True)
+            with patch.object(self.window, "_open_output_docx") as mock_open, \
+                 patch("PyQt5.QtWidgets.QMessageBox.information") as mock_info:
+                self.window._on_worker_finished(True, str(out_file))
+                mock_open.assert_called_once()
+                mock_info.assert_called_once()
+                self.assertTrue(self.window.btn_open_docx.isEnabled())
+
+            # Worker cancelled
+            with patch.object(self.window, "_append_log") as mock_log, \
+                 patch("PyQt5.QtWidgets.QMessageBox.critical") as mock_crit:
+                self.window._on_worker_finished(False, "Tiến trình đã bị người dùng hủy.")
+                mock_crit.assert_not_called()
+                self.assertIn("Đã hủy", self.window.lbl_status.text())
+
+    def test_open_output_docx_and_dir_missing(self) -> None:
+        self.window.last_generated_docx = Path("nonexistent_missing_file_xyz.docx")
+        with patch("PyQt5.QtWidgets.QMessageBox.warning") as mock_warn:
+            self.window._open_output_docx()
+            mock_warn.assert_called_once()
+            self.assertIn("Chưa tìm thấy tệp", mock_warn.call_args[0][2])
+
+    def test_frozen_env_path_and_google_api_key_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            fake_exe = Path(tmp_dir) / "ChuyenDoiVanBanPDF.exe"
+            with (
+                patch.object(sys, "frozen", True, create=True),
+                patch.object(sys, "executable", str(fake_exe)),
+            ):
+                frozen_win = MainWindow()
+                try:
+                    self.assertEqual(frozen_win.env_file_path, Path(tmp_dir).resolve() / ".env")
+                finally:
+                    frozen_win.close()
+
+            pdf_path = Path(tmp_dir) / "sample.pdf"
+            _create_minimal_pdf(pdf_path)
+            self.window.txt_pdf.setText(str(pdf_path))
+            self.window.txt_api_key.setText("")
+
+            old_gemini = os.environ.pop("GEMINI_API_KEY", None)
+            old_google = os.environ.get("GOOGLE_API_KEY")
+            os.environ["GOOGLE_API_KEY"] = "google_fallback_key"
+            try:
+                with patch("vn_pdf_to_docx.gui.ConversionWorker.start"):
+                    self.window._start_conversion()
+                    self.assertIsNotNone(self.window.worker)
+                    self.assertEqual(self.window.worker.api_key, "google_fallback_key")
+            finally:
+                if old_gemini is not None:
+                    os.environ["GEMINI_API_KEY"] = old_gemini
+                if old_google is not None:
+                    os.environ["GOOGLE_API_KEY"] = old_google
+                else:
+                    os.environ.pop("GOOGLE_API_KEY", None)
+
+    def test_skip_llm_checkbox_starts_without_api_key_and_warning_log(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pdf_path = Path(tmp_dir) / "offline_doc.pdf"
+            _create_minimal_pdf(pdf_path)
+            self.window.txt_pdf.setText(str(pdf_path))
+            self.window.txt_api_key.setText("")
+
+            old_gemini = os.environ.pop("GEMINI_API_KEY", None)
+            old_google = os.environ.pop("GOOGLE_API_KEY", None)
+            try:
+                self.window.chk_skip_llm.setChecked(True)
+                self.assertFalse(self.window.txt_api_key.isEnabled())
+                self.assertFalse(self.window.cmb_model.isEnabled())
+
+                with (
+                    patch("PyQt5.QtWidgets.QMessageBox.warning") as mock_warn,
+                    patch("vn_pdf_to_docx.gui.ConversionWorker.start") as mock_start,
+                ):
+                    self.window._start_conversion()
+                    mock_warn.assert_not_called()
+                    mock_start.assert_called_once()
+                    self.assertIsNotNone(self.window.worker)
+                    self.assertTrue(self.window.worker.skip_llm)
+
+                # Reset skip_llm -> re-enables API key and Model inputs
+                self.window.chk_skip_llm.setChecked(False)
+                self.assertTrue(self.window.txt_api_key.isEnabled())
+                self.assertTrue(self.window.cmb_model.isEnabled())
+
+                # Warning prefix renders without duplicating tag
+                warn_text = (
+                    "[CẢNH BÁO] Không thể gọi Gemini sửa chính tả, "
+                    "tự động sử dụng văn bản gốc từ VietOCR để xuất file Word"
+                )
+                self.window._append_log(warn_text, "WARNING")
+                plain_log = self.window.txt_log.toPlainText()
+                self.assertIn(warn_text, plain_log)
+                self.assertNotIn("[LƯU Ý] [CẢNH BÁO]", plain_log)
+            finally:
+                if old_gemini is not None:
+                    os.environ["GEMINI_API_KEY"] = old_gemini
+                if old_google is not None:
+                    os.environ["GOOGLE_API_KEY"] = old_google
+
+
+class TestConversionWorker(unittest.TestCase):
+    def test_worker_run_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pdf_path = Path(tmp_dir) / "test.pdf"
+            docx_path = Path(tmp_dir) / "test.docx"
+            _create_minimal_pdf(pdf_path)
+
+            mock_res = MagicMock()
+            mock_res.output_docx = docx_path
+
+            worker = ConversionWorker(
+                pdf_path=pdf_path,
+                output_docx=docx_path,
+                api_key="test-api-key",
+                model="gemini-2.5-flash",
+                dpi=100,
+                footer_align="center",
+                suppress_red=True,
+                page_numbers=[1],
+                save_json=None,
+                save_debug_dir=None,
+            )
+
+            progress_events: list[tuple[int, str]] = []
+            log_events: list[tuple[str, str]] = []
+            finish_event: list[tuple[bool, str]] = []
+
+            worker.sig_progress.connect(lambda pct, msg: progress_events.append((pct, msg)))
+            worker.sig_log.connect(lambda msg, lvl: log_events.append((msg, lvl)))
+            worker.sig_finished.connect(lambda ok, msg: finish_event.append((ok, msg)))
+
+            with patch("vn_pdf_to_docx.gui.convert_pdf_to_docx", return_value=mock_res) as mock_conv:
+                worker.run()
+                mock_conv.assert_called_once()
+
+            self.assertTrue(len(progress_events) >= 2)
+            self.assertEqual(finish_event, [(True, str(docx_path))])
+
+    def test_worker_run_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pdf_path = Path(tmp_dir) / "test.pdf"
+            docx_path = Path(tmp_dir) / "test.docx"
+
+            worker = ConversionWorker(
+                pdf_path=pdf_path,
+                output_docx=docx_path,
+                api_key="test-api-key",
+                model="gemini-2.5-flash",
+                dpi=100,
+                footer_align="center",
+                suppress_red=True,
+                page_numbers=None,
+                save_json=None,
+                save_debug_dir=None,
+            )
+
+            finish_event: list[tuple[bool, str]] = []
+            worker.sig_finished.connect(lambda ok, msg: finish_event.append((ok, msg)))
+
+            with patch("vn_pdf_to_docx.gui.convert_pdf_to_docx", side_effect=RuntimeError("Simulated OCR failure")):
+                worker.run()
+
+            self.assertEqual(len(finish_event), 1)
+            self.assertFalse(finish_event[0][0])
+            self.assertIn("Simulated OCR failure", finish_event[0][1])
+
+    def test_worker_cancellation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pdf_path = Path(tmp_dir) / "test.pdf"
+            docx_path = Path(tmp_dir) / "test.docx"
+
+            worker = ConversionWorker(
+                pdf_path=pdf_path,
+                output_docx=docx_path,
+                api_key="test-api-key",
+                model="gemini-2.5-flash",
+                dpi=100,
+                footer_align="center",
+                suppress_red=True,
+                page_numbers=None,
+                save_json=None,
+                save_debug_dir=None,
+            )
+
+            def fake_convert(*args, **kwargs):
+                cb = kwargs.get("detailed_progress_callback")
+                if cb:
+                    cb("preprocess", 1, 5, "Processing page 1")
+                return MagicMock()
+
+            worker.cancel()  # Signal cancel
+            finish_event: list[tuple[bool, str]] = []
+            worker.sig_finished.connect(lambda ok, msg: finish_event.append((ok, msg)))
+
+            with patch("vn_pdf_to_docx.gui.convert_pdf_to_docx", side_effect=fake_convert):
+                worker.run()
+
+            self.assertEqual(len(finish_event), 1)
+            self.assertFalse(finish_event[0][0])
+            self.assertIn("hủy", finish_event[0][1])
+
+
+if __name__ == "__main__":
+    unittest.main()
