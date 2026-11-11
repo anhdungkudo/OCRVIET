@@ -10,19 +10,6 @@ from pathlib import Path
 from typing import Optional
 
 try:
-    from dotenv import load_dotenv
-    if getattr(sys, "frozen", False):
-        _exe_env = Path(sys.executable).resolve().parent / ".env"
-        if _exe_env.exists():
-            load_dotenv(_exe_env, override=True)
-        else:
-            load_dotenv(override=True)
-    else:
-        load_dotenv(override=True)
-except ImportError:  # pragma: no cover
-    pass
-
-try:
     import pymupdf as fitz
 except ImportError:
     import fitz
@@ -88,9 +75,12 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from .docx_builder import DocxRenderConfig
+from .docx_builder import (
+    DocxRenderConfig,
+    find_next_available_docx_path,
+    is_file_write_locked,
+)
 from .exceptions import PdfToDocxError
-from .extractor import DEFAULT_MODEL_ROTATION, GeminiExtractorConfig
 from .ocr_layout import OcrLayoutConfig
 from .page_utils import parse_page_ranges
 from .pipeline import ConversionResult, convert_pdf_to_docx
@@ -262,44 +252,6 @@ QScrollBar::handle:vertical:hover {
 """
 
 
-def save_key_to_dotenv(
-    api_key: str,
-    model: str,
-    env_file_path: Optional[Path | str] = None,
-) -> Path:
-    """Save or update GEMINI_API_KEY and GEMINI_MODEL in the .env file."""
-    env_file = Path(env_file_path) if env_file_path is not None else Path(".env")
-
-    lines: list[str] = []
-    if env_file.exists():
-        lines = env_file.read_text(encoding="utf-8").splitlines()
-
-    new_lines: list[str] = []
-    has_key = False
-    has_model = False
-
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("GEMINI_API_KEY="):
-            new_lines.append(f"GEMINI_API_KEY={api_key.strip()}")
-            has_key = True
-        elif stripped.startswith("GEMINI_MODEL="):
-            new_lines.append(f"GEMINI_MODEL={model.strip()}")
-            has_model = True
-        else:
-            new_lines.append(line)
-
-    if not has_key:
-        new_lines.append(f"GEMINI_API_KEY={api_key.strip()}")
-    if not has_model:
-        new_lines.append(f"GEMINI_MODEL={model.strip()}")
-
-    env_file.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
-    os.environ["GEMINI_API_KEY"] = api_key.strip()
-    os.environ["GEMINI_MODEL"] = model.strip()
-    return env_file
-
-
 class ConversionWorker(QThread):
     """Background worker thread for converting PDF to DOCX without freezing GUI."""
 
@@ -311,28 +263,22 @@ class ConversionWorker(QThread):
         self,
         pdf_path: Path,
         output_docx: Path,
-        api_key: Optional[str],
-        model: str,
         dpi: int,
         footer_align: str,
         suppress_red: bool,
         page_numbers: Optional[list[int]],
         save_json: Optional[Path],
         save_debug_dir: Optional[Path],
-        skip_llm: bool = False,
     ) -> None:
         super().__init__()
         self.pdf_path = pdf_path
         self.output_docx = output_docx
-        self.api_key = api_key
-        self.model = model
         self.dpi = dpi
         self.footer_align = footer_align
         self.suppress_red = suppress_red
         self.page_numbers = page_numbers
         self.save_json = save_json
         self.save_debug_dir = save_debug_dir
-        self.skip_llm = skip_llm
         self._is_cancelled = False
 
     def cancel(self) -> None:
@@ -340,10 +286,10 @@ class ConversionWorker(QThread):
         self._is_cancelled = True
 
     def run(self) -> None:
-        """Run conversion pipeline with progress reporting."""
+        """Run 100% offline conversion pipeline with progress reporting."""
         try:
-            self.sig_log.emit(f"Bắt đầu chuyển đổi Hybrid tệp: {self.pdf_path.name}", "INFO")
-            self.sig_progress.emit(5, "Đang khởi tạo cấu hình Hybrid...")
+            self.sig_log.emit(f"Bắt đầu chuyển đổi Offline tệp: {self.pdf_path.name}", "INFO")
+            self.sig_progress.emit(5, "Đang khởi tạo cấu hình xử lý Offline...")
 
             prep_cfg = PreprocessConfig(
                 dpi=self.dpi,
@@ -351,7 +297,6 @@ class ConversionWorker(QThread):
                 nlm_h=10.0 if self.suppress_red else 0.0,
             )
             ocr_cfg = OcrLayoutConfig(dpi=self.dpi)
-            ext_cfg = GeminiExtractorConfig(model=self.model)
             doc_cfg = DocxRenderConfig(footer_left_alignment=self.footer_align)
 
             def detailed_cb(stage: str, cur: int, tot: int, msg: str) -> None:
@@ -361,16 +306,17 @@ class ConversionWorker(QThread):
                 pct = 10
                 log_level = "INFO"
                 if stage == "preprocess" and tot > 0:
-                    pct = int(10 + (cur / tot) * 20)  # 10% -> 30%
+                    pct = int(10 + (cur / tot) * 25)  # 10% -> 35%
                 elif stage == "ocr" and tot > 0:
-                    pct = int(30 + (cur / tot) * 45)  # 30% -> 75%
-                elif stage == "extract" and tot > 0:
-                    pct = int(75 + (cur / tot) * 15)  # 75% -> 90%
+                    pct = int(35 + (cur / tot) * 55)  # 35% -> 90%
                 elif stage == "warning":
                     pct = 90
                     log_level = "WARNING"
                 elif stage == "docx":
                     pct = 95
+                elif stage == "docx_warning":
+                    pct = 98
+                    log_level = "WARNING"
                 elif stage == "completed":
                     pct = 100
 
@@ -380,15 +326,12 @@ class ConversionWorker(QThread):
             result = convert_pdf_to_docx(
                 pdf_path=self.pdf_path,
                 output_docx_path=self.output_docx,
-                api_key=self.api_key,
                 preprocess_config=prep_cfg,
                 ocr_config=ocr_cfg,
-                extractor_config=ext_cfg,
                 docx_config=doc_cfg,
                 page_numbers=self.page_numbers,
                 save_debug_images_dir=self.save_debug_dir,
                 save_json_path=self.save_json,
-                skip_llm_correction=self.skip_llm,
                 detailed_progress_callback=detailed_cb,
             )
 
@@ -420,13 +363,8 @@ class MainWindow(QMainWindow):
         self.current_pdf_total_pages = 0
         self.last_generated_docx: Optional[Path] = None
         self._previous_suggested_docx = ""
-        if getattr(sys, "frozen", False):
-            self.env_file_path = Path(sys.executable).resolve().parent / ".env"
-        else:
-            self.env_file_path = Path(__file__).resolve().parent.parent / ".env"
 
         self._build_ui()
-        self._load_saved_env()
 
     def _build_ui(self) -> None:
         """Create and layout all widgets."""
@@ -451,7 +389,7 @@ class MainWindow(QMainWindow):
         title_label.setStyleSheet("color: #ffffff; background: transparent;")
 
         sub_label = QLabel(
-            "Khử dấu đỏ OpenCV • RapidOCR + VietOCR Offline • Sửa chính tả 1-Shot Text (Không gửi ảnh) • Chuẩn Nghị định 30/2020/NĐ-CP"
+            "Khử dấu đỏ OpenCV • Tự xoay trang ngang • RapidOCR + VietOCR Offline 100% • Chuẩn Nghị định 30/2020/NĐ-CP"
         )
         sub_label.setFont(QFont("Segoe UI", 10))
         sub_label.setStyleSheet("color: #e3f2fd; background: transparent;")
@@ -516,53 +454,28 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(pages_group)
 
         # 4. Settings Group (Collapsible / Compact)
-        settings_group = QGroupBox("3. Cấu Hình Gemini & Tùy Chọn Định Dạng")
+        settings_group = QGroupBox("3. Cấu Hình Xử Lý & Định Dạng Word")
         settings_layout = QGridLayout(settings_group)
         settings_layout.setSpacing(8)
 
-        # Row 0: API Key
-        settings_layout.addWidget(QLabel("Gemini API Key:"), 0, 0)
-        self.txt_api_key = QLineEdit()
-        self.txt_api_key.setEchoMode(QLineEdit.Password)
-        self.txt_api_key.setPlaceholderText("Nhập GEMINI_API_KEY (hoặc lưu trong file .env)...")
-        settings_layout.addWidget(self.txt_api_key, 0, 1)
-
-        key_btn_box = QHBoxLayout()
-        self.btn_show_key = QPushButton("👁 Hiện")
-        self.btn_show_key.setFixedWidth(70)
-        self.btn_show_key.clicked.connect(self._toggle_show_key)
-        key_btn_box.addWidget(self.btn_show_key)
-
-        self.btn_save_key = QPushButton("💾 Lưu vào .env")
-        self.btn_save_key.clicked.connect(self._save_env_key_action)
-        key_btn_box.addWidget(self.btn_save_key)
-        settings_layout.addLayout(key_btn_box, 0, 2)
-
-        # Row 1: Model & DPI
-        settings_layout.addWidget(QLabel("Gemini Model (1-Shot Text):"), 1, 0)
-        self.cmb_model = QComboBox()
-        self.cmb_model.setEditable(True)
-        self.cmb_model.addItems(DEFAULT_MODEL_ROTATION)
-        settings_layout.addWidget(self.cmb_model, 1, 1)
-
-        dpi_box = QHBoxLayout()
-        dpi_box.addWidget(QLabel("Độ nét (DPI):"))
+        # Row 0: DPI & Footer alignment
+        settings_layout.addWidget(QLabel("Độ nét (DPI):"), 0, 0)
         self.spn_dpi = QSpinBox()
         self.spn_dpi.setRange(72, 600)
         self.spn_dpi.setValue(200)
         self.spn_dpi.setSuffix(" DPI")
-        dpi_box.addWidget(self.spn_dpi)
-        settings_layout.addLayout(dpi_box, 1, 2)
+        settings_layout.addWidget(self.spn_dpi, 0, 1)
 
-        # Row 2: Footer alignment
-        settings_layout.addWidget(QLabel("Căn lề Nơi nhận:"), 2, 0)
+        align_box = QHBoxLayout()
+        align_box.addWidget(QLabel("Căn lề Nơi nhận:"))
         self.cmb_footer_align = QComboBox()
         self.cmb_footer_align.addItem("Căn giữa (Chuẩn thông dụng)", "center")
         self.cmb_footer_align.addItem("Căn trái (Nghị định 30)", "left")
-        settings_layout.addWidget(self.cmb_footer_align, 2, 1, 1, 2)
+        align_box.addWidget(self.cmb_footer_align, stretch=1)
+        settings_layout.addLayout(align_box, 0, 2)
 
-        # Row 3: Processing options
-        settings_layout.addWidget(QLabel("Tùy chọn xử lý:"), 3, 0)
+        # Row 1: Processing options
+        settings_layout.addWidget(QLabel("Tùy chọn xử lý:"), 1, 0)
         opt_box = QHBoxLayout()
         self.chk_suppress_red = QCheckBox("Khử dấu đỏ con dấu tròn (Kênh Red + NLM Denoise)")
         self.chk_suppress_red.setChecked(True)
@@ -578,17 +491,7 @@ class MainWindow(QMainWindow):
         self.chk_save_debug = QCheckBox("Lưu ảnh debug")
         opt_box.addWidget(self.chk_save_debug)
 
-        settings_layout.addLayout(opt_box, 3, 1, 1, 2)
-
-        # Row 4: Offline skip-LLM option
-        settings_layout.addWidget(QLabel("Chế độ Offline:"), 4, 0)
-        self.chk_skip_llm = QCheckBox(
-            "Bỏ qua bước sửa chính tả Gemini (Chỉ dùng VietOCR Offline để xuất Word ngay)"
-        )
-        self.chk_skip_llm.setChecked(False)
-        self.chk_skip_llm.setStyleSheet("font-weight: bold; color: #0d47a1;")
-        self.chk_skip_llm.toggled.connect(self._on_skip_llm_toggled)
-        settings_layout.addWidget(self.chk_skip_llm, 4, 1, 1, 2)
+        settings_layout.addLayout(opt_box, 1, 1, 1, 2)
 
         main_layout.addWidget(settings_group)
 
@@ -647,49 +550,6 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(self.txt_log, stretch=1)
 
         self._append_log("Ứng dụng đã sẵn sàng. Vui lòng chọn tệp PDF cần chuyển đổi.", "INFO")
-
-    def _load_saved_env(self) -> None:
-        """Load API key and Model from environment if present."""
-        key = os.environ.get("GEMINI_API_KEY", "").strip()
-        if key:
-            self.txt_api_key.setText(key)
-        model = os.environ.get("GEMINI_MODEL", "").strip()
-        if model:
-            idx = self.cmb_model.findText(model)
-            if idx >= 0:
-                self.cmb_model.setCurrentIndex(idx)
-            else:
-                self.cmb_model.setEditText(model)
-
-    def _toggle_show_key(self) -> None:
-        """Toggle echo mode of API key line edit."""
-        if self.txt_api_key.echoMode() == QLineEdit.Password:
-            self.txt_api_key.setEchoMode(QLineEdit.Normal)
-            self.btn_show_key.setText("🙈 Ẩn")
-        else:
-            self.txt_api_key.setEchoMode(QLineEdit.Password)
-            self.btn_show_key.setText("👁 Hiện")
-
-    def _save_env_key_action(self) -> None:
-        """Save API key and model to local .env."""
-        api_key = self.txt_api_key.text().strip()
-        model = self.cmb_model.currentText().strip()
-        if not api_key:
-            QMessageBox.warning(self, "Chưa nhập Key", "Vui lòng nhập Gemini API Key trước khi lưu.")
-            return
-        try:
-            save_key_to_dotenv(api_key, model, env_file_path=self.env_file_path)
-            QMessageBox.information(
-                self, "Đã lưu", "Đã lưu thành công Gemini API Key và Model vào file .env!"
-            )
-            self._append_log("Đã cập nhật Gemini API Key và Model vào .env", "SUCCESS")
-        except Exception as exc:
-            QMessageBox.critical(self, "Lỗi lưu file", f"Không thể ghi vào file .env: {exc}")
-
-    def _on_skip_llm_toggled(self, checked: bool) -> None:
-        """Enable or disable Gemini controls when offline-only VietOCR mode is selected."""
-        self.txt_api_key.setEnabled(not checked)
-        self.cmb_model.setEnabled(not checked)
 
     def _on_page_mode_toggled(self) -> None:
         """Enable or disable custom page range input based on radio selection."""
@@ -849,23 +709,24 @@ class MainWindow(QMainWindow):
         self.txt_docx.setText(docx_str)
         output_docx = Path(docx_str)
 
-        skip_llm = self.chk_skip_llm.isChecked()
-
-        # Gemini API Key check (not required when offline-only VietOCR mode is selected)
-        api_key = (
-            self.txt_api_key.text().strip()
-            or os.environ.get("GEMINI_API_KEY", "").strip()
-            or os.environ.get("GOOGLE_API_KEY", "").strip()
-        )
-        if not skip_llm and not api_key:
-            QMessageBox.warning(
+        if is_file_write_locked(output_docx):
+            alt_docx = find_next_available_docx_path(output_docx)
+            reply = QMessageBox.question(
                 self,
-                "Thiếu API Key",
-                "Chưa có Gemini API Key! Vui lòng nhập key, lưu vào file .env, hoặc tích chọn 'Bỏ qua bước sửa chính tả Gemini'.",
+                "Tệp Word Đang Mở",
+                (
+                    f"Tệp '{output_docx.name}' hiện đang được mở trong Microsoft Word (hoặc đang bị khóa ghi).\n\n"
+                    f"Bấm 'Yes' để tự động lưu sang tệp mới '{alt_docx.name}' và chạy ngay,\n"
+                    f"hoặc bấm 'No' để đóng Microsoft Word rồi thử lại."
+                ),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
             )
-            return
+            if reply != QMessageBox.Yes:
+                return
+            output_docx = alt_docx
+            self.txt_docx.setText(str(output_docx))
 
-        model = self.cmb_model.currentText().strip() or "gemini-3.8-flash"
         dpi = self.spn_dpi.value()
         suppress_red = self.chk_suppress_red.isChecked()
         footer_align = self.cmb_footer_align.currentData() or "center"
@@ -908,24 +769,20 @@ class MainWindow(QMainWindow):
         self.lbl_status.setStyleSheet("font-weight: bold; color: #1a73e8;")
 
         pages_desc = f"{len(page_numbers)} trang ({page_numbers})" if page_numbers else "Toàn bộ trang"
-        mode_desc = "Offline (Bỏ qua Gemini)" if skip_llm else f"Model: {model}"
         self._append_log(
-            f"Bắt đầu: {pdf_path.name} | {mode_desc} | DPI: {dpi} | Trang: {pages_desc} | Căn lề Nơi nhận: {footer_align}",
+            f"Bắt đầu: {pdf_path.name} | Offline VietOCR | DPI: {dpi} | Trang: {pages_desc} | Căn lề Nơi nhận: {footer_align}",
             "INFO",
         )
 
         self.worker = ConversionWorker(
             pdf_path=pdf_path,
             output_docx=output_docx,
-            api_key=api_key or None,
-            model=model,
             dpi=dpi,
             footer_align=footer_align,
             suppress_red=suppress_red,
             page_numbers=page_numbers,
             save_json=save_json,
             save_debug_dir=save_debug,
-            skip_llm=skip_llm,
         )
         self.worker.sig_progress.connect(self._on_worker_progress)
         self.worker.sig_log.connect(self._on_worker_log)

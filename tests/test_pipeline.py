@@ -83,7 +83,7 @@ def _sample_page_layouts() -> list[PageLayoutResult]:
 
 
 class TestPipeline(unittest.TestCase):
-    """Verify Hybrid pipeline execution, 1-shot batching, error wrapping, and artifacts."""
+    """Verify 3-step offline pipeline execution, error wrapping, and artifacts."""
 
     def test_save_debug_images_dir_existing_file_raises_pdf_to_docx_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -119,7 +119,7 @@ class TestPipeline(unittest.TestCase):
                     )
             self.assertIn("debug images directory", str(ctx.exception))
 
-    def test_hybrid_pipeline_runs_1_shot_for_all_pages_and_builds_real_docx(self) -> None:
+    def test_offline_pipeline_processes_all_pages_and_builds_real_docx(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_dir = Path(tmp)
             pdf_path = tmp_dir / "sample.pdf"
@@ -132,28 +132,12 @@ class TestPipeline(unittest.TestCase):
             fake_analyzer = MagicMock()
             fake_analyzer.process_document.return_value = _sample_page_layouts()
 
-            fake_corrector = MagicMock()
-            fake_corrector.correct_document_texts.return_value = {
-                "id_1": "SỞ NỘI VỤ",
-                "id_2": "CỘNG HÒA XÃ HỘI CHỦ NGHĨA VIỆT NAM",
-                "id_3": "QUYẾT ĐỊNH",
-                "id_4": "Điều 1. Quy định chung ngày 05/03/2020.",
-                "id_5": "Nơi nhận:",
-                "id_6": "- Lưu: VT.",
-                "id_7": "GIÁM ĐỐC",
-                "id_8": "Nguyễn Văn A",
-            }
-
             events: list[tuple[str, int, int]] = []
 
-            with (
-                patch.object(pipeline_mod, "LocalOcrLayoutAnalyzer", return_value=fake_analyzer),
-                patch.object(pipeline_mod, "GeminiTextCorrector", return_value=fake_corrector),
-            ):
+            with patch.object(pipeline_mod, "LocalOcrLayoutAnalyzer", return_value=fake_analyzer):
                 result = convert_pdf_to_docx(
                     pdf_path,
                     out_docx,
-                    api_key="dummy-key",
                     preprocess_config=PreprocessConfig(dpi=100, image_format="jpeg"),
                     save_debug_images_dir=debug_dir,
                     save_json_path=json_path,
@@ -164,17 +148,11 @@ class TestPipeline(unittest.TestCase):
             self.assertTrue((debug_dir / "page_001_preprocessed.png").read_bytes().startswith(b"\x89PNG"))
             self.assertTrue((debug_dir / "page_002_preprocessed.png").exists())
 
-            # GeminiTextCorrector.correct_document_texts called EXACTLY ONCE for all 2 pages!
-            fake_corrector.correct_document_texts.assert_called_once()
-            sent_dict = fake_corrector.correct_document_texts.call_args[0][0]
-            self.assertEqual(len(sent_dict), 8)
-            self.assertEqual(sent_dict["id_4"], "Điểu 1. Quy định chung ngày O5/O3/2O2O.")
-
-            # JSON persisted with corrected Vietnamese texts
+            # JSON persisted with VietOCR texts directly
             self.assertTrue(json_path.exists())
             loaded = json.loads(json_path.read_text(encoding="utf-8"))
             self.assertEqual(loaded["total_pages"], 2)
-            self.assertEqual(loaded["body_blocks"][2]["content"], "Điều 1. Quy định chung ngày 05/03/2020.")
+            self.assertEqual(loaded["body_blocks"][2]["content"], "Điểu 1. Quy định chung ngày O5/O3/2O2O.")
 
             # Real DOCX file built with invisible 2-col tables and aligned paragraphs
             self.assertTrue(result.output_docx.exists())
@@ -191,88 +169,6 @@ class TestPipeline(unittest.TestCase):
                 [("preprocessed", 2, 2), ("ocr", 2, 2), ("extracted", 2, 2), ("completed", 2, 2)],
             )
 
-    def test_pipeline_skip_llm_correction_makes_zero_gemini_calls(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_dir = Path(tmp)
-            pdf_path = tmp_dir / "sample.pdf"
-            _write_two_page_pdf(pdf_path)
-
-            fake_analyzer = MagicMock()
-            fake_analyzer.process_document.return_value = _sample_page_layouts()
-
-            with (
-                patch.object(pipeline_mod, "LocalOcrLayoutAnalyzer", return_value=fake_analyzer),
-                patch.object(pipeline_mod, "GeminiTextCorrector") as corrector_cls,
-            ):
-                result = convert_pdf_to_docx(
-                    pdf_path,
-                    tmp_dir / "offline.docx",
-                    preprocess_config=PreprocessConfig(dpi=100),
-                    skip_llm_correction=True,
-                )
-
-            corrector_cls.assert_not_called()
-            self.assertTrue(result.output_docx.exists())
-            self.assertEqual(result.corrected_text_batch, result.raw_text_batch)
-
-    def test_pipeline_graceful_degradation_on_429_or_network_error(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_dir = Path(tmp)
-            pdf_path = tmp_dir / "sample.pdf"
-            _write_two_page_pdf(pdf_path)
-
-            fake_analyzer = MagicMock()
-            fake_analyzer.process_document.return_value = _sample_page_layouts()
-
-            fake_corrector = MagicMock()
-            fake_corrector.correct_document_texts.side_effect = RuntimeError(
-                "429 RESOURCE_EXHAUSTED: Quota exceeded"
-            )
-
-            detailed_events: list[tuple[str, int, int, str]] = []
-            with (
-                patch.object(pipeline_mod, "LocalOcrLayoutAnalyzer", return_value=fake_analyzer),
-                patch.object(pipeline_mod, "GeminiTextCorrector", return_value=fake_corrector),
-                self.assertLogs("vn_pdf_to_docx.pipeline", level="WARNING") as log_ctx,
-            ):
-                result = convert_pdf_to_docx(
-                    pdf_path,
-                    tmp_dir / "fallback.docx",
-                    api_key="dummy-key",
-                    preprocess_config=PreprocessConfig(dpi=100),
-                    detailed_progress_callback=lambda st, c, t, m: detailed_events.append((st, c, t, m)),
-                )
-
-            self.assertTrue(result.output_docx.exists())
-            self.assertEqual(result.corrected_text_batch, result.raw_text_batch)
-
-            expected_warn = (
-                "[CẢNH BÁO] Không thể gọi Gemini sửa chính tả, "
-                "tự động sử dụng văn bản gốc từ VietOCR để xuất file Word"
-            )
-            self.assertTrue(any(expected_warn in entry for entry in log_ctx.output))
-            self.assertTrue(
-                any(st == "warning" and m == expected_warn for st, _, _, m in detailed_events)
-            )
-
-            doc = Document(str(result.output_docx))
-            body_text = "\n".join(p.text for p in doc.paragraphs)
-            self.assertIn("Điểu 1. Quy định chung ngày O5/O3/2O2O.", body_text)
-
-            # User cancellation (InterruptedError) must still propagate immediately
-            fake_corrector.correct_document_texts.side_effect = InterruptedError("Cancelled by user")
-            with (
-                patch.object(pipeline_mod, "LocalOcrLayoutAnalyzer", return_value=fake_analyzer),
-                patch.object(pipeline_mod, "GeminiTextCorrector", return_value=fake_corrector),
-            ):
-                with self.assertRaises(InterruptedError):
-                    convert_pdf_to_docx(
-                        pdf_path,
-                        tmp_dir / "cancelled.docx",
-                        api_key="dummy-key",
-                        preprocess_config=PreprocessConfig(dpi=100),
-                    )
-
     def test_save_json_path_error_raises_pdf_to_docx_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_dir = Path(tmp)
@@ -284,22 +180,48 @@ class TestPipeline(unittest.TestCase):
 
             fake_analyzer = MagicMock()
             fake_analyzer.process_document.return_value = _sample_page_layouts()
-            fake_corrector = MagicMock()
-            fake_corrector.correct_document_texts.return_value = {"id_1": "OK"}
 
-            with (
-                patch.object(pipeline_mod, "LocalOcrLayoutAnalyzer", return_value=fake_analyzer),
-                patch.object(pipeline_mod, "GeminiTextCorrector", return_value=fake_corrector),
-            ):
+            with patch.object(pipeline_mod, "LocalOcrLayoutAnalyzer", return_value=fake_analyzer):
                 with self.assertRaises(PdfToDocxError) as ctx:
                     convert_pdf_to_docx(
                         pdf_path,
                         tmp_dir / "out.docx",
-                        api_key="dummy-key",
                         preprocess_config=PreprocessConfig(dpi=100),
                         save_json_path=occupied_dir,
                     )
             self.assertIn("structured JSON", str(ctx.exception))
+
+    def test_pipeline_emits_warning_when_docx_saved_to_alternate_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            pdf_path = tmp_dir / "sample.pdf"
+            _write_two_page_pdf(pdf_path)
+
+            orig_out = tmp_dir / "Phan_07_XV_den_XVI.docx"
+            alt_out = (tmp_dir / "Phan_07_XV_den_XVI (1).docx").resolve()
+
+            fake_analyzer = MagicMock()
+            fake_analyzer.process_document.return_value = _sample_page_layouts()
+            detailed_events: list[tuple[str, int, int, str]] = []
+
+            with (
+                patch.object(pipeline_mod, "LocalOcrLayoutAnalyzer", return_value=fake_analyzer),
+                patch.object(pipeline_mod, "build_docx", return_value=alt_out),
+            ):
+                result = convert_pdf_to_docx(
+                    pdf_path,
+                    orig_out,
+                    preprocess_config=PreprocessConfig(dpi=100),
+                    detailed_progress_callback=lambda st, c, t, m: detailed_events.append((st, c, t, m)),
+                )
+
+            self.assertEqual(result.output_docx, alt_out)
+            self.assertTrue(
+                any(
+                    st == "docx_warning" and "Phan_07_XV_den_XVI (1).docx" in m
+                    for st, _, _, m in detailed_events
+                )
+            )
 
 
 if __name__ == "__main__":

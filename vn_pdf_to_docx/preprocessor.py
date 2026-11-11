@@ -58,6 +58,7 @@ class PreprocessedPage:
     image: np.ndarray
     encoded_bytes: bytes
     mime_type: str
+    is_landscape: bool = False
 
 
 def render_pdf_to_images(
@@ -410,6 +411,7 @@ def preprocess_pdf(
                 image=processed,
                 encoded_bytes=payload,
                 mime_type=mime_type,
+                is_landscape=bool(processed.shape[1] > processed.shape[0]),
             )
         )
     return results

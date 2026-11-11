@@ -1,4 +1,4 @@
-"""End-to-end Hybrid pipeline: PyMuPDF+OpenCV -> RapidOCR+VietOCR -> 1-Shot Gemini Text -> DOCX."""
+"""End-to-end 100% Offline pipeline: PyMuPDF+OpenCV -> Auto-Rotation/Table Grid + RapidOCR+VietOCR -> DOCX."""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ from typing import Callable, Iterable, Optional, Union
 
 from .docx_builder import DocxRenderConfig, build_docx
 from .exceptions import PdfToDocxError
-from .extractor import GeminiExtractorConfig, GeminiTextCorrector
 from .ocr_layout import (
     LocalOcrLayoutAnalyzer,
     OcrLayoutConfig,
@@ -25,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class ConversionResult:
-    """Artifacts returned from an end-to-end Hybrid PDF-to-DOCX conversion."""
+    """Artifacts returned from an end-to-end offline PDF-to-DOCX conversion."""
 
     output_docx: Path
     document: AdministrativeDocument
@@ -33,48 +32,40 @@ class ConversionResult:
     json_path: Optional[Path] = None
     page_layouts: list[PageLayoutResult] = field(default_factory=list)
     raw_text_batch: dict[str, str] = field(default_factory=dict)
-    corrected_text_batch: dict[str, str] = field(default_factory=dict)
 
 
 def convert_pdf_to_docx(
     pdf_path: Union[str, Path],
     output_docx_path: Union[str, Path],
     *,
-    api_key: Optional[str] = None,
     preprocess_config: Optional[PreprocessConfig] = None,
     ocr_config: Optional[OcrLayoutConfig] = None,
-    extractor_config: Optional[GeminiExtractorConfig] = None,
     docx_config: Optional[DocxRenderConfig] = None,
     page_numbers: Optional[Iterable[int]] = None,
     save_debug_images_dir: Optional[Union[str, Path]] = None,
     save_json_path: Optional[Union[str, Path]] = None,
-    skip_llm_correction: bool = False,
     progress_callback: Optional[Callable[[str, int, int], None]] = None,
     detailed_progress_callback: Optional[Callable[[str, int, int, str], None]] = None,
 ) -> ConversionResult:
-    """Convert a scanned Vietnamese administrative PDF/A to DOCX using the Hybrid pipeline.
+    """Convert a scanned Vietnamese administrative PDF/A to DOCX 100% offline.
 
-    Sequential Steps (no multithreading):
-        1. Rasterize PDF pages at 200 DPI via PyMuPDF (`fitz`), isolate/suppress red seals
-           using the Red channel, and sharpen text via `cv2.fastNlMeansDenoising` + `CLAHE`.
-        2. Run `rapidocr_onnxruntime` text detection, group lines (Y <= 10px), detect
-           `two_column_row` (45% split), `center` (±8%), `justify`, and `first_line_indent`,
-           and recognize Vietnamese crops sequentially with `vietocr` (`vgg_transformer`, CPU).
-        3. Flatten all pages' raw text into `{"id_1": "...", ...}` and send text-only
-           in 1 batch request (or <= 5000 words/chunk) to the selected primary Gemini
-           model (with graceful degradation to raw VietOCR text on 429/network failure).
-        4. Reconstruct an A4 Microsoft Word (`.docx`) file complying with Nghị định
-           30/2020/NĐ-CP margins, Times New Roman 13pt, centered 2-column invisible
-           tables for `two_column_row` blocks, and aligned/indented paragraphs.
+    Sequential Steps (no multithreading, no cloud API calls):
+        1. Rasterize PDF pages at 200 DPI via PyMuPDF (`fitz`), suppress red seals via the
+           Red channel, and sharpen text via `cv2.fastNlMeansDenoising` + `CLAHE`.
+        2. Auto-orient rotated 90°/270° landscape scans, detect OpenCV table grids &
+           `two_column_row` / alignment rules with `rapidocr_onnxruntime`, and recognize
+           Vietnamese text sequentially with `vietocr` (`vgg_transformer`, CPU).
+        3. Reconstruct an A4 Word (`.docx`) file with Nghị định 30/2020/NĐ-CP margins,
+           dynamic Portrait/Landscape sections, centered 2-column borderless tables, and
+           `Table Grid` data tables.
     """
     src_path = Path(pdf_path)
     out_docx = Path(output_docx_path)
     prep_cfg = preprocess_config or PreprocessConfig()
     ocr_cfg = ocr_config or OcrLayoutConfig(dpi=prep_cfg.dpi)
-    ext_cfg = extractor_config or GeminiExtractorConfig()
     doc_cfg = docx_config or DocxRenderConfig()
 
-    logger.info("Step 1/4: Rendering & preprocessing '%s' at %d DPI...", src_path, prep_cfg.dpi)
+    logger.info("Step 1/3: Rendering & preprocessing '%s' at %d DPI...", src_path, prep_cfg.dpi)
     if detailed_progress_callback is not None:
         detailed_progress_callback(
             "render", 0, 0, f"Đang nạp PDF & chuẩn bị tiền xử lý ({prep_cfg.dpi} DPI)..."
@@ -125,7 +116,7 @@ def convert_pdf_to_docx(
 
     # Step 2: Offline RapidOCR + X/Y Layout + VietOCR (sequential CPU)
     logger.info(
-        "Step 2/4: Running offline RapidOCR + layout + VietOCR (%s) across %d page(s)...",
+        "Step 2/3: Running offline RapidOCR + layout + VietOCR (%s) across %d page(s)...",
         ocr_cfg.vietocr_config_name,
         total_pages,
     )
@@ -148,56 +139,9 @@ def convert_pdf_to_docx(
     if progress_callback is not None:
         progress_callback("ocr", total_pages, total_pages)
 
-    raw_text_batch, bindings = collect_document_text_batch(page_layouts)
-
-    # Step 3: 1-Shot text-only Gemini batch correction (NO images sent) with Graceful Degradation
-    if raw_text_batch and not skip_llm_correction:
-        logger.info(
-            "Step 3/4: Correcting %d text segment(s) in text-only batch mode via %s...",
-            len(raw_text_batch),
-            ext_cfg.model,
-        )
-
-        def _on_extract_batch(cur_batch: int, total_batches: int) -> None:
-            if detailed_progress_callback is not None:
-                detailed_progress_callback(
-                    "extract",
-                    cur_batch,
-                    total_batches,
-                    f"Đang sửa lỗi chính tả tiếng Việt 1-Shot (Batch {cur_batch}/{total_batches}, không gửi ảnh)...",
-                )
-
-        try:
-            corrector = GeminiTextCorrector(api_key=api_key, config=ext_cfg)
-            corrected_text_batch = corrector.correct_document_texts(
-                raw_text_batch,
-                batch_callback=_on_extract_batch,
-            )
-        except InterruptedError:
-            raise
-        except Exception as exc:
-            warning_msg = (
-                "[CẢNH BÁO] Không thể gọi Gemini sửa chính tả, "
-                "tự động sử dụng văn bản gốc từ VietOCR để xuất file Word"
-            )
-            logger.warning("%s (Chi tiết: %s)", warning_msg, exc)
-            if detailed_progress_callback is not None:
-                detailed_progress_callback("warning", total_pages, total_pages, warning_msg)
-            corrected_text_batch = dict(raw_text_batch)
-    else:
-        if skip_llm_correction and raw_text_batch and detailed_progress_callback is not None:
-            detailed_progress_callback(
-                "extract",
-                1,
-                1,
-                "Bỏ qua bước sửa chính tả Gemini — dùng trực tiếp văn bản VietOCR Offline...",
-            )
-        corrected_text_batch = dict(raw_text_batch)
-
+    raw_text_batch, _ = collect_document_text_batch(page_layouts)
     extracted_doc = build_administrative_document_from_layouts(
         page_layouts,
-        corrected_text_batch,
-        bindings,
         source_pdf=str(src_path),
     )
 
@@ -220,8 +164,8 @@ def convert_pdf_to_docx(
                 f"Failed to save structured JSON '{written_json_path}': {exc}"
             ) from exc
 
-    # Step 4: Build Word (.docx)
-    logger.info("Step 4/4: Building formatted Word document '%s'...", out_docx)
+    # Step 3: Build Word (.docx)
+    logger.info("Step 3/3: Building formatted Word document '%s'...", out_docx)
     if detailed_progress_callback is not None:
         detailed_progress_callback(
             "docx",
@@ -231,6 +175,14 @@ def convert_pdf_to_docx(
         )
 
     resolved_docx = build_docx(extracted_doc, out_docx, config=doc_cfg)
+    if resolved_docx != out_docx.resolve():
+        lock_warn = (
+            f"[CẢNH BÁO] Tệp '{out_docx.name}' đang được mở trong Word hoặc bị khóa ghi — "
+            f"đã tự động lưu kết quả sang tệp mới: '{resolved_docx.name}'"
+        )
+        logger.warning("%s", lock_warn)
+        if detailed_progress_callback is not None:
+            detailed_progress_callback("docx_warning", total_pages, total_pages, lock_warn)
 
     if progress_callback is not None:
         progress_callback("completed", total_pages, total_pages)
@@ -250,5 +202,4 @@ def convert_pdf_to_docx(
         json_path=written_json_path,
         page_layouts=page_layouts,
         raw_text_batch=raw_text_batch,
-        corrected_text_batch=corrected_text_batch,
     )

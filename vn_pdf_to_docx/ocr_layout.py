@@ -20,9 +20,15 @@ from typing import Any, Callable, Iterable, Iterator, Literal, Optional, Sequenc
 import cv2
 import numpy as np
 from PIL import Image
-from pydantic import BaseModel, Field
 
 from .exceptions import LocalOcrError
+from .ocr_models import (
+    DetectedLine,
+    LayoutSegment,
+    OcrLayoutConfig,
+    PageLayoutResult,
+    TextBox,
+)
 from .preprocessor import PreprocessedPage
 from .schemas import (
     AdministrativeDocument,
@@ -30,6 +36,15 @@ from .schemas import (
     PageStructure,
     merge_page_structures,
     normalize_vietnamese_text,
+)
+from .table_detector import (
+    DetectedTableGrid,
+    build_table_data_from_grid,
+    detect_table_grids,
+    extract_tables_via_column_projection,
+    filter_clipped_edge_boxes,
+    partition_boxes_by_tables,
+    split_boxes_by_grid_dividers,
 )
 
 logger = logging.getLogger(__name__)
@@ -224,144 +239,6 @@ def _resolve_local_vietocr_weights(weights_value: str) -> str:
         except OSError:
             continue
     return weights_value
-
-
-class OcrLayoutConfig(BaseModel):
-    """Configuration for offline RapidOCR detection, X/Y layout rules, and VietOCR."""
-
-    dpi: int = Field(default=200, ge=72, le=1200)
-    line_y_tolerance_px: float = Field(
-        default=10.0,
-        gt=0.0,
-        le=60.0,
-        description="Max vertical Y-center difference (px) to group boxes into the same line.",
-    )
-    two_col_split_ratio: float = Field(
-        default=0.45,
-        gt=0.2,
-        lt=0.8,
-        description="Horizontal split threshold (~45% page width) separating left and right columns.",
-    )
-    center_tolerance_ratio: float = Field(
-        default=0.08,
-        gt=0.0,
-        lt=0.3,
-        description="Allowed ±8% page-width tolerance around horizontal center for centered lines.",
-    )
-    indent_min_px: float = Field(
-        default=30.0,
-        ge=5.0,
-        le=200.0,
-        description="Minimum left-margin offset (px at 200 DPI) treated as first_line_indent=True.",
-    )
-    indent_max_px: float = Field(
-        default=110.0,
-        ge=30.0,
-        le=300.0,
-        description="Maximum left-margin offset (px at 200 DPI) treated as first_line_indent=True (covers 30-80px and 1.27cm).",
-    )
-    cluster_gap_px: Optional[float] = Field(
-        default=None,
-        gt=0.0,
-        description="Optional override for horizontal gap separating clusters on the same line.",
-    )
-    crop_padding_px: int = Field(
-        default=3,
-        ge=0,
-        le=20,
-        description="Padding (px) added around detected text boxes before VietOCR recognition.",
-    )
-    vietocr_config_name: str = Field(default="vgg_transformer", min_length=1)
-    vietocr_device: str = Field(default="cpu", min_length=1)
-    vietocr_weights: Optional[str] = Field(default=None)
-
-
-class TextBox(BaseModel):
-    """Axis-aligned text bounding box `[x_min, y_min, x_max, y_max]` with optional text."""
-
-    x_min: float
-    y_min: float
-    x_max: float
-    y_max: float
-    text: str = ""
-
-    @property
-    def width(self) -> float:
-        return max(0.0, self.x_max - self.x_min)
-
-    @property
-    def height(self) -> float:
-        return max(0.0, self.y_max - self.y_min)
-
-    @property
-    def center_x(self) -> float:
-        return (self.x_min + self.x_max) / 2.0
-
-    @property
-    def center_y(self) -> float:
-        return (self.y_min + self.y_max) / 2.0
-
-
-class DetectedLine(BaseModel):
-    """Single horizontal line of grouped boxes with X-based layout classification."""
-
-    line_index: int = 0
-    boxes: list[TextBox] = Field(default_factory=list)
-    x_min: float
-    y_min: float
-    x_max: float
-    y_max: float
-    line_type: Literal["single", "two_column_row"] = "single"
-    alignment: Literal["left", "center", "right", "justify"] = "left"
-    first_line_indent: bool = False
-    is_tabular_row: bool = False
-    left_boxes: list[TextBox] = Field(default_factory=list)
-    right_boxes: list[TextBox] = Field(default_factory=list)
-    left_text: str = ""
-    right_text: str = ""
-    text: str = ""
-
-    @property
-    def center_x(self) -> float:
-        return (self.x_min + self.x_max) / 2.0
-
-    @property
-    def center_y(self) -> float:
-        return (self.y_min + self.y_max) / 2.0
-
-    @property
-    def width(self) -> float:
-        return max(0.0, self.x_max - self.x_min)
-
-    @property
-    def height(self) -> float:
-        return max(0.0, self.y_max - self.y_min)
-
-
-class LayoutSegment(BaseModel):
-    """Logical page layout block (either a paragraph or a 2-column borderless table)."""
-
-    kind: Literal["paragraph", "two_column_table"]
-    page_number: int = Field(default=1, ge=1)
-    alignment: Literal["left", "center", "right", "justify"] = "left"
-    first_line_indent: bool = False
-    bold: bool = False
-    italic: bool = False
-    text: str = ""
-    left_lines: list[str] = Field(default_factory=list)
-    right_lines: list[str] = Field(default_factory=list)
-
-
-class PageLayoutResult(BaseModel):
-    """Offline OCR & layout analysis output for a single page."""
-
-    page_number: int = Field(default=1, ge=1)
-    page_width: int = Field(ge=1)
-    page_height: int = Field(ge=1)
-    body_left_margin: float
-    body_right_margin: float
-    lines: list[DetectedLine] = Field(default_factory=list)
-    segments: list[LayoutSegment] = Field(default_factory=list)
 
 
 def _is_real_number(value: Any) -> bool:
@@ -1612,6 +1489,19 @@ def _is_right_column_only(line: DetectedLine, page_width: int, split_ratio: floa
     )
 
 
+def _interval_blocked(
+    y_start: float,
+    y_end: float,
+    blocked_y_ranges: Sequence[tuple[float, float]],
+) -> bool:
+    """Return True if a detected table block sits vertically between two non-grid lines."""
+    for b_y1, b_y2 in blocked_y_ranges:
+        mid_y = (b_y1 + b_y2) / 2.0
+        if y_start <= mid_y <= y_end:
+            return True
+    return False
+
+
 def group_lines_into_segments(
     lines: Sequence[DetectedLine],
     *,
@@ -1620,12 +1510,14 @@ def group_lines_into_segments(
     page_height: int,
     body_right_margin: float,
     config: Optional[OcrLayoutConfig] = None,
+    blocked_y_ranges: Optional[Sequence[tuple[float, float]]] = None,
 ) -> list[LayoutSegment]:
     """Group consecutive `two_column_row` lines into 2-column tables and wrap prose lines."""
     cfg = config or OcrLayoutConfig()
     if not lines:
         return []
 
+    blocked = list(blocked_y_ranges or [])
     heights = [ln.height for ln in lines if ln.height > 0]
     median_h = float(statistics.median(heights)) if heights else 24.0
     scale = cfg.dpi / 200.0
@@ -1664,6 +1556,7 @@ def group_lines_into_segments(
                 look_ahead < min(n, i + 3)
                 and lines[look_ahead].line_type == "single"
                 and not lines[look_ahead].is_tabular_row
+                and not _interval_blocked(lines[look_ahead - 1].y_max, lines[look_ahead].y_min, blocked)
                 and (lines[look_ahead].y_min - lines[look_ahead - 1].y_max) <= max(35.0 * scale, 2.2 * median_h)
                 and (
                     _is_left_column_only(lines[look_ahead], page_width, cfg.two_col_split_ratio)
@@ -1674,6 +1567,7 @@ def group_lines_into_segments(
             if (
                 look_ahead < n
                 and lines[look_ahead].line_type == "two_column_row"
+                and not _interval_blocked(lines[look_ahead - 1].y_max, lines[look_ahead].y_min, blocked)
                 and (lines[look_ahead].y_min - lines[look_ahead - 1].y_max) <= max(35.0 * scale, 2.2 * median_h)
             ):
                 for k in range(i, look_ahead):
@@ -1703,6 +1597,8 @@ def group_lines_into_segments(
             while k < n:
                 nxt = lines[k]
                 if nxt.line_type != "single" or nxt.is_tabular_row:
+                    break
+                if _interval_blocked(lines[k - 1].y_max, nxt.y_min, blocked):
                     break
                 nxt_is_left = _is_left_column_only(nxt, page_width, cfg.two_col_split_ratio)
                 nxt_is_right = _is_right_column_only(nxt, page_width, cfg.two_col_split_ratio)
@@ -1745,6 +1641,8 @@ def group_lines_into_segments(
                         LayoutSegment(
                             kind="two_column_table",
                             page_number=page_number,
+                            y_min=float(lines[i].y_min),
+                            y_max=float(lines[k - 1].y_max),
                             alignment="center",
                             first_line_indent=False,
                             left_lines=stagger_left,
@@ -1755,6 +1653,8 @@ def group_lines_into_segments(
                     continue
 
         if cur.line_type == "two_column_row":
+            seg_y_min = float(pre_left and lines[max(0, i - len(pre_left))].y_min or cur.y_min)
+            seg_y_max = float(cur.y_max)
             left_lines: list[str] = pre_left + ([cur.left_text] if cur.left_text else [])
             right_lines: list[str] = pre_right + ([cur.right_text] if cur.right_text else [])
             last_left_y_max = cur.y_max if left_lines else None
@@ -1764,6 +1664,8 @@ def group_lines_into_segments(
             while j < n:
                 nxt = lines[j]
                 prev_anchor_y = lines[j - 1].y_max
+                if _interval_blocked(prev_anchor_y, nxt.y_min, blocked):
+                    break
 
                 if nxt.line_type == "two_column_row":
                     if (nxt.y_min - prev_anchor_y) > max(120.0 * scale, 5.5 * median_h):
@@ -1779,12 +1681,14 @@ def group_lines_into_segments(
                             right_lines.append("")
                         right_lines.append(nxt.right_text)
                         last_right_y_max = nxt.y_max
+                    seg_y_max = max(seg_y_max, float(nxt.y_max))
                     j += 1
                     continue
 
                 # Absorb single-column lines sandwiched before another two_column_row
                 sandwiched_two_col = any(
                     lines[k].line_type == "two_column_row"
+                    and not _interval_blocked(nxt.y_max, lines[k].y_min, blocked)
                     and (lines[k].y_min - nxt.y_max) <= max(100.0 * scale, 4.5 * median_h)
                     for k in range(j + 1, min(n, j + 4))
                 )
@@ -1803,6 +1707,7 @@ def group_lines_into_segments(
                             right_lines.append("")
                         right_lines.append(nxt.text)
                         last_right_y_max = nxt.y_max
+                    seg_y_max = max(seg_y_max, float(nxt.y_max))
                     j += 1
                     continue
 
@@ -1812,6 +1717,7 @@ def group_lines_into_segments(
                 )
                 has_upcoming_right_signer = any(
                     _is_right_column_only(lines[k], page_width, cfg.two_col_split_ratio)
+                    and not _interval_blocked(cur.y_max, lines[k].y_min, blocked)
                     and (lines[k].y_min - cur.y_max) <= sig_gap_limit
                     for k in range(j + 1, min(n, j + 7))
                 )
@@ -1825,6 +1731,7 @@ def group_lines_into_segments(
                     if nxt.text:
                         left_lines.append(nxt.text)
                         last_left_y_max = nxt.y_max
+                    seg_y_max = max(seg_y_max, float(nxt.y_max))
                     j += 1
                     continue
 
@@ -1839,6 +1746,7 @@ def group_lines_into_segments(
                             right_lines.append("")
                         right_lines.append(nxt.text)
                         last_right_y_max = nxt.y_max
+                    seg_y_max = max(seg_y_max, float(nxt.y_max))
                     j += 1
                     continue
 
@@ -1848,6 +1756,8 @@ def group_lines_into_segments(
                 LayoutSegment(
                     kind="two_column_table",
                     page_number=page_number,
+                    y_min=min(seg_y_min, float(cur.y_min)),
+                    y_max=seg_y_max,
                     alignment="center",
                     first_line_indent=False,
                     left_lines=left_lines,
@@ -1862,6 +1772,8 @@ def group_lines_into_segments(
         para_alignment = cur.alignment
         para_indent = cur.first_line_indent
         prev_line = cur
+        seg_y_min = float(cur.y_min)
+        seg_y_max = float(cur.y_max)
         j = i + 1
 
         if not cur.is_tabular_row and cur.alignment in ("justify", "left"):
@@ -1872,6 +1784,7 @@ def group_lines_into_segments(
                     or nxt.is_tabular_row
                     or nxt.alignment not in ("justify", "left")
                     or nxt.first_line_indent
+                    or _interval_blocked(prev_line.y_max, nxt.y_min, blocked)
                 ):
                     break
 
@@ -1883,6 +1796,7 @@ def group_lines_into_segments(
                 if nxt.text:
                     para_lines.append(nxt.text)
                 prev_line = nxt
+                seg_y_max = max(seg_y_max, float(nxt.y_max))
                 j += 1
 
         joined_text = " ".join(part for part in para_lines if part).strip()
@@ -1891,6 +1805,8 @@ def group_lines_into_segments(
                 LayoutSegment(
                     kind="paragraph",
                     page_number=page_number,
+                    y_min=seg_y_min,
+                    y_max=seg_y_max,
                     alignment=para_alignment,
                     first_line_indent=para_indent,
                     text=joined_text,
@@ -1899,6 +1815,261 @@ def group_lines_into_segments(
         i = j
 
     return segments
+
+
+_HAS_LETTER_RE = re.compile(r"[^\W\d_]", re.UNICODE)
+
+_LANDSCAPE_HEADER_STRONG_KWS = (
+    "mã tương đương",
+    "mã tương",
+    "tên dịch vụ",
+    "phê duyệt giá",
+    "mức giá",
+    "đơn giá",
+    "thành tiền",
+    "ghi chú",
+    "danh mục",
+    "nội dung",
+    "stt",
+    "cộng hòa",
+    "cộng hoà",
+    "quyết định",
+    "thông tư",
+    "phụ lục",
+)
+_VN_DIACRITIC_CHARS = frozenset(
+    "àáảãạăằắẳẵặâầấẩẫậđèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợùúủũụưừứửữựỳýỷỹỵ"
+)
+_WEIRD_UPSIDEDOWN_CHAR_RE = re.compile(r"[\[\]'?;\\]")
+_MIXED_LETTER_DIGIT_RE = re.compile(r"[a-zà-ỹ][0-9]|[0-9][a-zà-ỹ]{2,}")
+
+
+def detect_vertical_text_ratio(
+    boxes: Sequence[TextBox],
+    *,
+    min_aspect_ratio: float = 2.0,
+) -> tuple[float, int]:
+    """Return `(vertical_ratio, valid_box_count)` where vertical boxes satisfy `h > w * ratio`."""
+    valid = [b for b in boxes if b.width >= 4.0 and b.height >= 4.0]
+    if not valid:
+        valid = [b for b in boxes if b.width > 0.0 and b.height > 0.0]
+    if not valid:
+        return 0.0, 0
+    vertical_count = sum(1 for b in valid if b.height > (b.width * min_aspect_ratio))
+    return float(vertical_count) / float(len(valid)), len(valid)
+
+
+def rotate_boxes_90(
+    boxes: Sequence[TextBox],
+    img_height: int,
+    img_width: int,
+    rotate_code: int,
+) -> list[TextBox]:
+    """Project `(x_min, y_min, x_max, y_max)` coordinates across OpenCV 90°/270° rotation."""
+    h = float(img_height)
+    w = float(img_width)
+    rotated: list[TextBox] = []
+    if rotate_code == cv2.ROTATE_90_CLOCKWISE:
+        for b in boxes:
+            rotated.append(
+                b.model_copy(
+                    update={
+                        "x_min": h - b.y_max,
+                        "y_min": b.x_min,
+                        "x_max": h - b.y_min,
+                        "y_max": b.x_max,
+                    }
+                )
+            )
+    elif rotate_code == cv2.ROTATE_90_COUNTERCLOCKWISE:
+        for b in boxes:
+            rotated.append(
+                b.model_copy(
+                    update={
+                        "x_min": b.y_min,
+                        "y_min": w - b.x_max,
+                        "x_max": b.y_max,
+                        "y_max": w - b.x_min,
+                    }
+                )
+            )
+    else:
+        raise ValueError(f"Unsupported rotate_code: {rotate_code}")
+    return rotated
+
+
+def score_landscape_orientation_texts(
+    top_texts: Sequence[str],
+    *,
+    bottom_texts: Sequence[str] = (),
+) -> float:
+    """Score upright Vietnamese readability & header keyword presence for 90° vs 270°."""
+    score = 0.0
+    joined_top = " | ".join(t.strip().lower() for t in top_texts if t.strip())
+    for kw in _LANDSCAPE_HEADER_STRONG_KWS:
+        if kw in joined_top:
+            score += 100.0
+
+    for txt in top_texts:
+        stripped = txt.strip()
+        if not stripped:
+            continue
+        if stripped.isdigit() and len(stripped) <= 3:
+            score -= 15.0
+            continue
+        for tok in stripped.split():
+            low = tok.lower()
+            has_vn = any(c in _VN_DIACRITIC_CHARS for c in low)
+            has_weird = bool(
+                _WEIRD_UPSIDEDOWN_CHAR_RE.search(tok)
+                or _MIXED_LETTER_DIGIT_RE.search(tok)
+            )
+            cleaned_alpha = tok.replace("-", "").replace(",", "").replace(".", "")
+            if has_weird:
+                score -= 8.0
+            elif has_vn and cleaned_alpha.isalpha():
+                score += 6.0
+            elif tok.isalpha() and len(tok) >= 2:
+                score += 2.0
+
+    for btxt in bottom_texts:
+        s = btxt.strip()
+        if s.isdigit() and 1 <= len(s) <= 3:
+            score += 20.0
+    return score
+
+
+def _select_orientation_probe_boxes(
+    boxes: Sequence[TextBox],
+    *,
+    img_width: int,
+    img_height: int,
+) -> tuple[list[TextBox], list[TextBox]]:
+    """Select up to 5 top-region boxes and 1 bottom-center page-number candidate."""
+    top_cands = sorted(
+        [b for b in boxes if b.center_y < (0.22 * img_height) and b.width >= 16.0],
+        key=lambda b: (b.y_min, b.x_min),
+    )[:5]
+    if len(top_cands) < 3:
+        top_cands = sorted(boxes, key=lambda b: (b.y_min, b.x_min))[:5]
+
+    bottom_cands = sorted(
+        [
+            b
+            for b in boxes
+            if b.center_y > (0.88 * img_height)
+            and (0.25 * img_width) <= b.center_x <= (0.75 * img_width)
+            and b.width <= 120.0
+        ],
+        key=lambda b: -b.center_y,
+    )[:1]
+    return top_cands, bottom_cands
+
+
+def detect_and_fix_orientation(
+    image: np.ndarray,
+    *,
+    detector: RapidOcrDetector,
+    recognizer: VietOcrRecognizer,
+    config: OcrLayoutConfig,
+    color_order: Literal["RGB", "BGR"] = "RGB",
+    pdf_is_landscape: bool = False,
+) -> tuple[np.ndarray, bool, Literal[0, 90, 270], list[TextBox]]:
+    """Detect Landscape PDFs or rotated-90° vertical-text scans and return `(upright_img, is_landscape, angle, boxes)`."""
+    h, w = image.shape[:2]
+    raw_boxes = detector.detect_boxes(image, color_order=color_order)
+
+    if w > h or pdf_is_landscape:
+        return image, True, 0, raw_boxes
+
+    vertical_ratio, valid_count = detect_vertical_text_ratio(
+        raw_boxes,
+        min_aspect_ratio=config.vertical_box_aspect_threshold,
+    )
+    should_rotate = config.auto_rotate_landscape and (
+        (valid_count >= 3 and vertical_ratio > config.vertical_box_majority_ratio)
+        or (1 <= valid_count <= 2 and vertical_ratio >= 0.99)
+    )
+    if not should_rotate:
+        return image, False, 0, raw_boxes
+
+    # Evaluate both 90° CCW (270) and 90° CW (90) candidates using top-band VietOCR readability
+    img_ccw = cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    ccw_h, ccw_w = img_ccw.shape[:2]
+    ccw_boxes = rotate_boxes_90(raw_boxes, h, w, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    ccw_top_boxes, ccw_bot_boxes = _select_orientation_probe_boxes(
+        ccw_boxes, img_width=ccw_w, img_height=ccw_h
+    )
+    ccw_top_texts = [
+        recognizer.recognize_box(
+            img_ccw, b, padding_px=config.crop_padding_px, color_order=color_order
+        )
+        for b in ccw_top_boxes
+    ]
+    ccw_bot_texts = [
+        recognizer.recognize_box(
+            img_ccw, b, padding_px=config.crop_padding_px, color_order=color_order
+        )
+        for b in ccw_bot_boxes
+    ]
+    score_ccw = score_landscape_orientation_texts(
+        ccw_top_texts, bottom_texts=ccw_bot_texts
+    )
+
+    img_cw = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
+    cw_h, cw_w = img_cw.shape[:2]
+    cw_boxes = rotate_boxes_90(raw_boxes, h, w, cv2.ROTATE_90_CLOCKWISE)
+    cw_top_boxes, cw_bot_boxes = _select_orientation_probe_boxes(
+        cw_boxes, img_width=cw_w, img_height=cw_h
+    )
+    cw_top_texts = [
+        recognizer.recognize_box(
+            img_cw, b, padding_px=config.crop_padding_px, color_order=color_order
+        )
+        for b in cw_top_boxes
+    ]
+    cw_bot_texts = [
+        recognizer.recognize_box(
+            img_cw, b, padding_px=config.crop_padding_px, color_order=color_order
+        )
+        for b in cw_bot_boxes
+    ]
+    score_cw = score_landscape_orientation_texts(
+        cw_top_texts, bottom_texts=cw_bot_texts
+    )
+
+    if score_cw > score_ccw:
+        winning_img = img_cw
+        winning_angle: Literal[0, 90, 270] = 90
+        winning_boxes = cw_boxes
+    else:
+        winning_img = img_ccw
+        winning_angle = 270
+        winning_boxes = ccw_boxes
+
+    # Re-run RapidOCR once on the upright image for tighter horizontal text boxes,
+    # keeping projected boxes if detector output looks unchanged (e.g., mocked detector).
+    redetected = detector.detect_boxes(winning_img, color_order=color_order)
+    if redetected:
+        redet_ratio, redet_count = detect_vertical_text_ratio(
+            redetected,
+            min_aspect_ratio=config.vertical_box_aspect_threshold,
+        )
+        if redet_count > 0 and redet_ratio <= 0.50:
+            winning_boxes = redetected
+
+    logger.info(
+        "Auto-rotated page (%dx%d -> %dx%d, %.0f%% vertical boxes) by %d deg into Landscape (CCW=%.1f vs CW=%.1f).",
+        w,
+        h,
+        winning_img.shape[1],
+        winning_img.shape[0],
+        vertical_ratio * 100.0,
+        winning_angle,
+        score_ccw,
+        score_cw,
+    )
+    return winning_img, True, winning_angle, winning_boxes
 
 
 def _recognize_lines_sequentially(
@@ -1926,7 +2097,7 @@ def _recognize_lines_sequentially(
 
 
 class LocalOcrLayoutAnalyzer:
-    """Sequential Step 2 analyzer combining RapidOCR detection, X/Y layout, and VietOCR."""
+    """Sequential Step 2 analyzer combining OpenCV grid tables, RapidOCR, X/Y layout, and VietOCR."""
 
     def __init__(
         self,
@@ -1960,45 +2131,152 @@ class LocalOcrLayoutAnalyzer:
         page_number: int = 1,
         color_order: Literal["RGB", "BGR"] = "RGB",
         fallback_margins: Optional[tuple[float, float]] = None,
+        pdf_is_landscape: bool = False,
     ) -> PageLayoutResult:
-        """Detect boxes, group lines, run VietOCR sequentially, and build layout segments."""
+        """Auto-orient rotated landscape scans, detect OpenCV grids + RapidOCR boxes, run VietOCR, and build segments."""
         if not isinstance(image, np.ndarray) or image.size == 0 or image.ndim not in (2, 3):
             raise LocalOcrError(f"Invalid image on page {page_number}.")
 
-        h, w = image.shape[:2]
         detector = self._get_detector()
         recognizer = self._get_recognizer()
 
-        raw_boxes = detector.detect_boxes(image, color_order=color_order)
-        grouped = group_boxes_into_lines(
+        # 0. Auto-detect Portrait vs Landscape (width > height or >60% vertical text boxes)
+        working_image, is_landscape, rotation_angle, raw_boxes = detect_and_fix_orientation(
+            image,
+            detector=detector,
+            recognizer=recognizer,
+            config=self.config,
+            color_order=color_order,
+            pdf_is_landscape=pdf_is_landscape,
+        )
+        h, w = working_image.shape[:2]
+        usable_width_cm = 25.7 if is_landscape else 16.5
+
+        # 1. Detect bordered table grids via OpenCV morphology BEFORE grouping lines
+        grids = detect_table_grids(working_image, dpi=self.config.dpi, color_order=color_order)
+
+        # 2. Split any wide RapidOCR boxes crossing confirmed vertical grid rules, then run VietOCR
+        raw_boxes = split_boxes_by_grid_dividers(raw_boxes, grids, dpi=self.config.dpi)
+        ordered_lines = group_boxes_into_lines(
             raw_boxes, y_tolerance_px=self.config.line_y_tolerance_px
         )
         recognized_lines = _recognize_lines_sequentially(
-            image,
-            grouped,
+            working_image,
+            ordered_lines,
             recognizer,
             self.config,
             color_order=color_order,
         )
-        classified_lines, body_left, body_right = classify_page_lines(
-            recognized_lines,
-            page_width=w,
-            config=self.config,
-            fallback_margins=fallback_margins,
+        recognized_boxes = [box for ln in recognized_lines for box in ln]
+
+        # 3. Assign boxes whose center lies inside any OpenCV table bbox directly to (r, c) cells
+        populated_grids, outside_boxes = partition_boxes_by_tables(
+            recognized_boxes, grids, dpi=self.config.dpi
         )
-        segments = group_lines_into_segments(
-            classified_lines,
-            page_number=page_number,
-            page_width=w,
-            page_height=h,
-            body_right_margin=body_right,
-            config=self.config,
+        outside_boxes = filter_clipped_edge_boxes(
+            outside_boxes, grids, page_width=w, dpi=self.config.dpi
+        )
+
+        table_segments: list[LayoutSegment] = []
+        blocked_y_ranges: list[tuple[float, float]] = []
+
+        for grid, grid_boxes in populated_grids:
+            rows, colspans, col_widths, col_aligns, hdr_rows = build_table_data_from_grid(
+                grid,
+                grid_boxes,
+                dpi=self.config.dpi,
+                y_tolerance_px=self.config.line_y_tolerance_px,
+                is_landscape=is_landscape,
+                usable_width_cm=usable_width_cm,
+            )
+            if not rows:
+                continue
+            blocked_y_ranges.append((float(grid.y_min), float(grid.y_max)))
+            table_segments.append(
+                LayoutSegment(
+                    kind="table",
+                    page_number=page_number,
+                    y_min=float(grid.y_min),
+                    y_max=float(grid.y_max),
+                    alignment="center",
+                    first_line_indent=False,
+                    table_rows=rows,
+                    cell_colspans=colspans,
+                    col_widths_cm=col_widths,
+                    col_alignments=col_aligns,
+                    header_rows=hdr_rows,
+                )
+            )
+
+        # 4. Run line grouping, X-alignment rules, and Column Projection fallback on outside boxes
+        if outside_boxes:
+            outside_lines = group_boxes_into_lines(
+                outside_boxes, y_tolerance_px=self.config.line_y_tolerance_px
+            )
+            classified_lines, body_left, body_right = classify_page_lines(
+                outside_lines,
+                page_width=w,
+                config=self.config,
+                fallback_margins=fallback_margins,
+            )
+            remaining_lines, projected_tables = extract_tables_via_column_projection(
+                classified_lines,
+                page_width=w,
+                dpi=self.config.dpi,
+                y_tolerance_px=self.config.line_y_tolerance_px,
+                is_landscape=is_landscape,
+                usable_width_cm=usable_width_cm,
+            )
+            for proj in projected_tables:
+                blocked_y_ranges.append((float(proj.y_min), float(proj.y_max)))
+                table_segments.append(
+                    LayoutSegment(
+                        kind="table",
+                        page_number=page_number,
+                        y_min=float(proj.y_min),
+                        y_max=float(proj.y_max),
+                        alignment="center",
+                        first_line_indent=False,
+                        table_rows=proj.rows,
+                        cell_colspans=proj.row_colspans,
+                        col_widths_cm=proj.col_widths_cm,
+                        col_alignments=proj.col_alignments,
+                        header_rows=proj.header_rows,
+                    )
+                )
+
+            non_table_segments = group_lines_into_segments(
+                remaining_lines,
+                page_number=page_number,
+                page_width=w,
+                page_height=h,
+                body_right_margin=body_right,
+                config=self.config,
+                blocked_y_ranges=blocked_y_ranges,
+            )
+        else:
+            classified_lines = []
+            if fallback_margins is not None:
+                body_left, body_right = fallback_margins
+            elif table_segments:
+                body_left = float(min(g.x_min for g, _ in populated_grids))
+                body_right = float(max(g.x_max for g, _ in populated_grids))
+            else:
+                body_left = 0.14 * float(w)
+                body_right = 0.92 * float(w)
+            non_table_segments = []
+
+        segments = sorted(
+            [*non_table_segments, *table_segments],
+            key=lambda seg: (seg.y_min, 0 if seg.kind != "paragraph" else 1),
         )
 
         return PageLayoutResult(
             page_number=page_number,
             page_width=w,
             page_height=h,
+            is_landscape=is_landscape,
+            rotation_angle=rotation_angle,
             body_left_margin=body_left,
             body_right_margin=body_right,
             lines=classified_lines,
@@ -2018,19 +2296,24 @@ class LocalOcrLayoutAnalyzer:
 
         results: list[PageLayoutResult] = []
         total = len(page_list)
-        doc_margins: Optional[tuple[float, float]] = None
+        portrait_margins: Optional[tuple[float, float]] = None
 
         for idx, page in enumerate(page_list, 1):
             if page_callback is not None:
                 page_callback(idx, total)
+            page_is_wide = bool(
+                getattr(page, "is_landscape", False)
+                or (isinstance(page.image, np.ndarray) and page.image.ndim >= 2 and page.image.shape[1] > page.image.shape[0])
+            )
             page_res = self.process_page(
                 page.image,
                 page_number=page.page_number,
                 color_order="RGB",
-                fallback_margins=doc_margins,
+                fallback_margins=None if page_is_wide else portrait_margins,
+                pdf_is_landscape=bool(getattr(page, "is_landscape", False)),
             )
-            if doc_margins is None and page_res.lines:
-                doc_margins = (page_res.body_left_margin, page_res.body_right_margin)
+            if not page_res.is_landscape and portrait_margins is None and page_res.lines:
+                portrait_margins = (page_res.body_left_margin, page_res.body_right_margin)
             results.append(page_res)
 
         return results
@@ -2070,37 +2353,51 @@ def collect_document_text_batch(
                         counter += 1
                         flat_dict[key] = line.strip()
                         bindings.append((key, p_idx, s_idx, "right_line", r_idx))
+            elif seg.kind == "table":
+                for r_idx, row in enumerate(seg.table_rows):
+                    for c_idx, cell in enumerate(row):
+                        cleaned_cell = cell.strip()
+                        if cleaned_cell and _HAS_LETTER_RE.search(cleaned_cell):
+                            key = f"id_{counter}"
+                            counter += 1
+                            flat_dict[key] = cleaned_cell
+                            bindings.append((key, p_idx, s_idx, f"table_cell:{r_idx}", c_idx))
 
     return flat_dict, bindings
 
 
 def build_administrative_document_from_layouts(
     pages: Sequence[PageLayoutResult],
-    corrected_texts: dict[str, str],
-    bindings: Sequence[tuple[str, int, int, str, int]],
+    corrected_texts: Optional[dict[str, str]] = None,
+    bindings: Optional[Sequence[tuple[str, int, int, str, int]]] = None,
     *,
     source_pdf: Optional[str] = None,
 ) -> AdministrativeDocument:
-    """Substitute Gemini-corrected texts back into layout blocks and build `AdministrativeDocument`."""
+    """Assemble offline OCR & layout blocks into an `AdministrativeDocument`."""
     if not pages:
         raise LocalOcrError("Cannot build AdministrativeDocument from empty page layouts.")
 
     # Deep copy segments cleanly so original layouts are not mutated unexpectedly
     cloned_pages = [page.model_copy(deep=True) for page in pages]
 
-    for key, p_idx, s_idx, slot_kind, line_idx in bindings:
-        if key not in corrected_texts:
-            continue
-        new_text = normalize_vietnamese_text(corrected_texts[key]) or ""
-        if not new_text:
-            continue
-        seg = cloned_pages[p_idx].segments[s_idx]
-        if slot_kind == "paragraph":
-            seg.text = new_text
-        elif slot_kind == "left_line":
-            seg.left_lines[line_idx] = new_text
-        elif slot_kind == "right_line":
-            seg.right_lines[line_idx] = new_text
+    if corrected_texts and bindings:
+        for key, p_idx, s_idx, slot_kind, line_idx in bindings:
+            if key not in corrected_texts:
+                continue
+            new_text = normalize_vietnamese_text(corrected_texts[key]) or ""
+            if not new_text:
+                continue
+            seg = cloned_pages[p_idx].segments[s_idx]
+            if slot_kind == "paragraph":
+                seg.text = new_text
+            elif slot_kind == "left_line":
+                seg.left_lines[line_idx] = new_text
+            elif slot_kind == "right_line":
+                seg.right_lines[line_idx] = new_text
+            elif slot_kind.startswith("table_cell:"):
+                r_idx = int(slot_kind.split(":", 1)[1])
+                if 0 <= r_idx < len(seg.table_rows) and 0 <= line_idx < len(seg.table_rows[r_idx]):
+                    seg.table_rows[r_idx][line_idx] = new_text
 
     page_structures: list[PageStructure] = []
     for page in cloned_pages:
@@ -2134,9 +2431,27 @@ def build_administrative_document_from_layouts(
                         content=[[left_text, right_text]],
                     )
                 )
+            elif seg.kind == "table":
+                if not seg.table_rows:
+                    continue
+                body_blocks.append(
+                    BodyBlock(
+                        type="table",
+                        alignment="center",
+                        first_line_indent=False,
+                        bold=False,
+                        italic=False,
+                        content=seg.table_rows,
+                        cell_colspans=seg.cell_colspans,
+                        col_widths_cm=seg.col_widths_cm,
+                        col_alignments=seg.col_alignments,
+                        header_rows=seg.header_rows,
+                    )
+                )
         page_structures.append(
             PageStructure(
                 page_number=page.page_number,
+                is_landscape=page.is_landscape,
                 body_blocks=body_blocks,
             )
         )

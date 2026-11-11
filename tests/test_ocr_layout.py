@@ -802,7 +802,6 @@ class TestOcrLayout(unittest.TestCase):
                 sample_pdf,
                 out_docx,
                 preprocess_config=PreprocessConfig(dpi=200),
-                skip_llm_correction=True,
             )
             self.assertTrue(result.output_docx.is_file())
             self.assertGreater(result.output_docx.stat().st_size, 10_000)

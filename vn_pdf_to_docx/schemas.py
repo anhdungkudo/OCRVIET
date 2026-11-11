@@ -5,7 +5,7 @@ from __future__ import annotations
 import unicodedata
 from typing import Any, Literal, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 def normalize_vietnamese_text(value: Optional[str]) -> Optional[str]:
@@ -21,26 +21,6 @@ def _normalize_cell_or_text(value: Any) -> str:
     if value is None:
         return ""
     return normalize_vietnamese_text(str(value)) or ""
-
-
-def _strip_schema_defaults(schema: dict[str, Any]) -> None:
-    """Recursively strip 'default' keys from JSON Schema for Gemini OpenAPI compatibility."""
-
-    def _walk(node: Any, is_schema_obj: bool = True) -> None:
-        if isinstance(node, dict):
-            if is_schema_obj:
-                node.pop("default", None)
-            for key, val in node.items():
-                if key in ("properties", "$defs", "definitions") and isinstance(val, dict):
-                    for sub_schema in val.values():
-                        _walk(sub_schema, True)
-                else:
-                    _walk(val, isinstance(val, dict))
-        elif isinstance(node, list):
-            for item in node:
-                _walk(item, True)
-
-    _walk(schema, True)
 
 
 class HeaderTable(BaseModel):
@@ -156,6 +136,23 @@ class BodyBlock(BaseModel):
     content: Union[str, list[list[str]]] = Field(
         description="Chuỗi văn bản nếu type='paragraph', hoặc mảng 2 chiều list[list[str]] nếu type='table' / 'two_column_table'."
     )
+    cell_colspans: Optional[list[list[int]]] = Field(
+        default=None,
+        description="Tùy chọn: số cột gộp (colspan) theo từng hàng của bảng (VD: [[1,1,1], [3]]).",
+    )
+    col_widths_cm: Optional[list[float]] = Field(
+        default=None,
+        description="Tùy chọn: độ rộng chuẩn từng cột tính bằng cm (VD: [1.2, 11.5, 3.0]).",
+    )
+    col_alignments: Optional[list[Literal["left", "center", "right", "justify"]]] = Field(
+        default=None,
+        description="Tùy chọn: căn lề dữ liệu theo từng cột (VD: ['center', 'left', 'right']).",
+    )
+    header_rows: int = Field(
+        default=0,
+        ge=0,
+        description="Số hàng tiêu đề ở đầu bảng được căn giữa và in đậm.",
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -265,6 +262,7 @@ class PageStructure(BaseModel):
     """Canonical structured extraction for a single PDF page."""
 
     page_number: int = Field(default=1, ge=1)
+    is_landscape: bool = False
     header_table: Optional[HeaderTable] = None
     title_block: Optional[TitleBlock] = None
     body_blocks: list[BodyBlock] = Field(default_factory=list)
@@ -281,240 +279,6 @@ class AdministrativeDocument(BaseModel):
     body_blocks: list[BodyBlock] = Field(default_factory=list)
     footer_table: Optional[FooterTable] = None
     pages: list[PageStructure] = Field(default_factory=list)
-
-
-# ---------------------------------------------------------------------------
-# Gemini Structured-Output Transport Schema
-# ---------------------------------------------------------------------------
-# Note:
-# 1. Separating `text_content` and `table_rows` avoids non-null polymorphic
-#    `Union[str, list[list[str]]]` (`anyOf`) inside `google-genai` `response_schema`.
-# 2. Using dedicated Gemini sub-models without non-None string `default` values
-#    keeps the JSON Schema free of `"default": "..."` keys (which Gemini schema
-#    validators can reject) and prevents empty header objects from inventing
-#    default Quốc hiệu / Tiêu ngữ on continuation pages.
-
-
-class GeminiHeaderTable(BaseModel):
-    """Gemini response_schema representation of HeaderTable without string defaults."""
-
-    model_config = ConfigDict(json_schema_extra=_strip_schema_defaults)
-
-    co_quan_chu_quan: Optional[str] = Field(
-        description="Tên cơ quan, tổ chức chủ quản trực tiếp cấp trên ở cột trái (để null nếu không có)."
-    )
-    co_quan_ban_hanh: Optional[str] = Field(
-        description="Tên cơ quan, tổ chức ban hành văn bản ở cột trái (để chuỗi rỗng '' hoặc null nếu không có)."
-    )
-    so_ky_hieu: Optional[str] = Field(
-        description="Số và ký hiệu văn bản ở cột trái (VD: 'Số: 123/QĐ-UBND'; để '' hoặc null nếu không có)."
-    )
-    quoc_hieu: Optional[str] = Field(
-        description="Quốc hiệu ở cột phải (VD: 'CỘNG HÒA XÃ HỘI CHỦ NGHĨA VIỆT NAM'; để '' hoặc null nếu không có)."
-    )
-    tieu_ngu: Optional[str] = Field(
-        description="Tiêu ngữ ở cột phải (VD: 'Độc lập - Tự do - Hạnh phúc'; để '' hoặc null nếu không có)."
-    )
-    dia_danh_ngay_thang: Optional[str] = Field(
-        description="Địa danh và ngày tháng năm ban hành ở cột phải (để '' hoặc null nếu không có)."
-    )
-
-
-class GeminiTitleBlock(BaseModel):
-    """Gemini response_schema representation of TitleBlock without string defaults."""
-
-    model_config = ConfigDict(json_schema_extra=_strip_schema_defaults)
-
-    ten_loai_van_ban: Optional[str] = Field(
-        description="Tên loại văn bản hành chính (VD: 'QUYẾT ĐỊNH', 'THÔNG BÁO'; để null nếu là Công văn)."
-    )
-    trich_yeu: Optional[str] = Field(
-        description="Trích yếu nội dung văn bản (VD: 'Về việc ban hành...'; để '' hoặc null nếu không có)."
-    )
-
-
-class GeminiFooterTable(BaseModel):
-    """Gemini response_schema representation of FooterTable without string defaults."""
-
-    model_config = ConfigDict(json_schema_extra=_strip_schema_defaults)
-
-    noi_nhan: Optional[str] = Field(
-        description="Nội dung cột trái Nơi nhận (các dòng phân tách bởi '\\n'; để '' hoặc null nếu không có)."
-    )
-    chuc_vu_nguoi_ky: Optional[str] = Field(
-        description="Quyền hạn và chức vụ người ký ở cột phải (VD: 'KT. CHỦ TỊCH\\nPHÓ CHỦ TỊCH'; để '' hoặc null nếu không có)."
-    )
-    ho_ten_nguoi_ky: Optional[str] = Field(
-        description="Họ và tên người ký ở cột phải (chữ in, bỏ qua chữ ký tay và chữ trong con dấu đỏ)."
-    )
-
-
-class GeminiBodyBlock(BaseModel):
-    """Gemini response_schema item for a body block without polymorphic Union."""
-
-    model_config = ConfigDict(json_schema_extra=_strip_schema_defaults)
-
-    type: Literal["paragraph", "table"] = Field(
-        description="Loại khối: 'paragraph' cho đoạn văn/tiêu đề, 'table' cho bảng biểu."
-    )
-    alignment: Literal["left", "center", "right", "justify"] = Field(
-        description="Căn lề của khối: 'left', 'center', 'right', hoặc 'justify'."
-    )
-    first_line_indent: bool = Field(
-        description="True nếu dòng đầu của đoạn văn có thụt lề đầu dòng (1.27cm), ngược lại False."
-    )
-    bold: bool = Field(description="True nếu toàn khối được in đậm.")
-    italic: bool = Field(description="True nếu toàn khối được in nghiêng.")
-    text_content: Optional[str] = Field(
-        default=None,
-        description="Nội dung văn bản đã sửa 100% lỗi chính tả nếu type='paragraph'. Để null nếu type='table'.",
-    )
-    table_rows: Optional[list[list[str]]] = Field(
-        default=None,
-        description="Mảng 2 chiều các hàng và ô (đã sửa lỗi chính tả) nếu type='table'. Để null nếu type='paragraph'.",
-    )
-
-    @field_validator("table_rows", mode="before")
-    @classmethod
-    def _coerce_null_table_cells(cls, value: object) -> object:
-        if isinstance(value, list):
-            return [
-                ["" if cell is None else cell for cell in row]
-                if isinstance(row, list)
-                else row
-                for row in value
-            ]
-        return value
-
-
-class GeminiPageExtraction(BaseModel):
-    """Gemini response_schema root model for one scanned page."""
-
-    model_config = ConfigDict(json_schema_extra=_strip_schema_defaults)
-
-    header_table: Optional[GeminiHeaderTable] = Field(
-        default=None,
-        description="Thông tin quốc hiệu, tiêu ngữ, cơ quan ban hành, số ký hiệu nếu xuất hiện ở đầu trang này; nếu không có để null.",
-    )
-    title_block: Optional[GeminiTitleBlock] = Field(
-        default=None,
-        description="Tên loại văn bản và trích yếu nếu xuất hiện trên trang này; nếu không có để null.",
-    )
-    body_blocks: list[GeminiBodyBlock] = Field(
-        description="Danh sách các khối nội dung (đoạn văn và bảng) theo đúng thứ tự từ trên xuống dưới.",
-    )
-    footer_table: Optional[GeminiFooterTable] = Field(
-        default=None,
-        description="Khối Nơi nhận và Chức vụ/Họ tên người ký nếu xuất hiện ở cuối trang này; nếu không có để null.",
-    )
-
-    @field_validator("header_table", "title_block", "footer_table", mode="before")
-    @classmethod
-    def _coerce_canonical_submodels(cls, value: object) -> object:
-        if isinstance(value, (HeaderTable, TitleBlock, FooterTable)):
-            return value.model_dump()
-        return value
-
-
-def gemini_extraction_to_page_structure(
-    raw: GeminiPageExtraction,
-    page_number: int = 1,
-) -> PageStructure:
-    """Convert a Gemini transport payload into a canonical PageStructure."""
-    header: Optional[HeaderTable] = None
-    if raw.header_table is not None:
-        candidate_header = HeaderTable(
-            co_quan_chu_quan=raw.header_table.co_quan_chu_quan,
-            co_quan_ban_hanh=raw.header_table.co_quan_ban_hanh or "",
-            so_ky_hieu=raw.header_table.so_ky_hieu or "",
-            quoc_hieu=raw.header_table.quoc_hieu or "",
-            tieu_ngu=raw.header_table.tieu_ngu or "",
-            dia_danh_ngay_thang=raw.header_table.dia_danh_ngay_thang or "",
-        )
-        if not candidate_header.is_empty():
-            header = candidate_header
-
-    title: Optional[TitleBlock] = None
-    if raw.title_block is not None:
-        candidate_title = TitleBlock(
-            ten_loai_van_ban=raw.title_block.ten_loai_van_ban,
-            trich_yeu=raw.title_block.trich_yeu or "",
-        )
-        if not candidate_title.is_empty():
-            title = candidate_title
-
-    footer: Optional[FooterTable] = None
-    if raw.footer_table is not None:
-        candidate_footer = FooterTable(
-            noi_nhan=raw.footer_table.noi_nhan or "",
-            chuc_vu_nguoi_ky=raw.footer_table.chuc_vu_nguoi_ky or "",
-            ho_ten_nguoi_ky=raw.footer_table.ho_ten_nguoi_ky or "",
-        )
-        if not candidate_footer.is_empty():
-            footer = candidate_footer
-
-    canonical_blocks: list[BodyBlock] = []
-    for block in raw.body_blocks:
-        if block.type == "paragraph":
-            text = _normalize_cell_or_text(block.text_content)
-            if not text and block.table_rows:
-                text = "\n".join(
-                    " ".join(
-                        _normalize_cell_or_text(cell) for cell in row
-                    ).strip()
-                    for row in block.table_rows
-                ).strip()
-            if not text:
-                continue
-            canonical_blocks.append(
-                BodyBlock(
-                    type="paragraph",
-                    alignment=block.alignment,
-                    first_line_indent=block.first_line_indent,
-                    bold=block.bold,
-                    italic=block.italic,
-                    content=text,
-                )
-            )
-        else:
-            rows = block.table_rows or []
-            cleaned_rows = [
-                [_normalize_cell_or_text(cell) for cell in row]
-                for row in rows
-                if any(_normalize_cell_or_text(c) for c in row) or len(row) > 0
-            ]
-            if not cleaned_rows:
-                fallback_text = _normalize_cell_or_text(block.text_content)
-                if fallback_text:
-                    canonical_blocks.append(
-                        BodyBlock(
-                            type="paragraph",
-                            alignment=block.alignment,
-                            first_line_indent=block.first_line_indent,
-                            bold=block.bold,
-                            italic=block.italic,
-                            content=fallback_text,
-                        )
-                    )
-                continue
-            canonical_blocks.append(
-                BodyBlock(
-                    type="table",
-                    alignment=block.alignment,
-                    first_line_indent=False,
-                    bold=block.bold,
-                    italic=block.italic,
-                    content=cleaned_rows,
-                )
-            )
-
-    return PageStructure(
-        page_number=page_number,
-        header_table=header,
-        title_block=title,
-        body_blocks=canonical_blocks,
-        footer_table=footer,
-    )
 
 
 def merge_page_structures(

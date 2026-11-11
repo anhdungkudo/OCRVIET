@@ -17,9 +17,5 @@ class LocalOcrError(PdfToDocxError):
     """Raised when offline RapidOCR / VietOCR detection, recognition, or layout fails."""
 
 
-class GeminiExtractionError(PdfToDocxError):
-    """Raised when Gemini text-only spelling correction fails or returns invalid JSON."""
-
-
 class DocxBuildError(PdfToDocxError):
     """Raised when constructing or saving the target Microsoft Word (.docx) fails."""

@@ -91,7 +91,6 @@ def main() -> int:
         "--copy-metadata", "gdown",
         "--copy-metadata", "vietocr",
         "--copy-metadata", "rapidocr_onnxruntime",
-        "--collect-submodules", "google.genai",
         "--collect-submodules", "vn_pdf_to_docx",
         "--collect-submodules", "rapidocr_onnxruntime",
         "--hidden-import", "vietocr",
@@ -108,7 +107,6 @@ def main() -> int:
         "--hidden-import", "vietocr.model.seqmodel.transformer",
         "--hidden-import", "vietocr.model.seqmodel.seq2seq",
         "--hidden-import", "vietocr.model.seqmodel.convseq2seq",
-        "--hidden-import", "dotenv",
         "--hidden-import", "fitz",
         "--hidden-import", "pymupdf",
         "--hidden-import", "cv2",
@@ -206,10 +204,7 @@ def main() -> int:
         print(f"\n❌ Đóng gói thất bại với mã lỗi {returncode}.")
         return returncode
 
-    # Copy file mẫu cấu hình .env sang thư mục xuất nếu cần
     target_output = dist_dir / app_name if not args.onefile else dist_dir
-    env_file = project_root / ".env"
-    env_example = project_root / ".env.example"
 
     if target_output.exists():
         # Remove older 2020 MSVC runtime DLLs inside PyQt5\Qt5\bin when newer ones exist
@@ -228,12 +223,6 @@ def main() -> int:
             ):
                 if (internal_dir / stale_dll.lower()).is_file() or (internal_dir / stale_dll).is_file():
                     (qt_bin_dir / stale_dll).unlink(missing_ok=True)
-        if env_file.exists():
-            shutil.copy(env_file, target_output / ".env")
-            print(f"📋 Đã sao chép .env vào {target_output}")
-        elif env_example.exists():
-            shutil.copy(env_example, target_output / ".env")
-            print(f"📋 Đã sao chép .env.example vào {target_output}")
 
     print("\n" + "=" * 65)
     print("🎉 CHÚC MỪNG! BẠN ĐÃ ĐÓNG GÓI ỨNG DỤNG THÀNH CÔNG!")

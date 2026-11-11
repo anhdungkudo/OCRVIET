@@ -1,4 +1,4 @@
-"""Vietnamese scanned administrative PDF/A to DOCX converter (Hybrid Architecture)."""
+"""Vietnamese scanned administrative PDF/A to DOCX converter (100% Offline Engine)."""
 
 import os
 import sys
@@ -37,34 +37,13 @@ def _preload_win_msvc_runtime() -> None:
 
 _preload_win_msvc_runtime()
 
-try:
-    from dotenv import load_dotenv
-    if getattr(sys, "frozen", False):
-        exe_env = Path(sys.executable).resolve().parent / ".env"
-        if exe_env.exists():
-            load_dotenv(exe_env, override=True)
-        else:
-            load_dotenv(override=True)
-    else:
-        load_dotenv(override=True)
-except ImportError:  # pragma: no cover
-    pass
-
 from .docx_builder import DocxRenderConfig, build_docx
 from .exceptions import (
     DocxBuildError,
-    GeminiExtractionError,
     ImagePreprocessError,
     LocalOcrError,
     PdfRenderError,
     PdfToDocxError,
-)
-from .extractor import (
-    DEFAULT_MODEL_ROTATION,
-    GeminiExtractorConfig,
-    GeminiTextCorrector,
-    build_model_rotation,
-    split_text_dict_into_batches,
 )
 from .ocr_layout import (
     DetectedLine,
@@ -78,8 +57,20 @@ from .ocr_layout import (
     build_administrative_document_from_layouts,
     classify_page_lines,
     collect_document_text_batch,
+    detect_and_fix_orientation,
+    detect_vertical_text_ratio,
     group_boxes_into_lines,
     group_lines_into_segments,
+    rotate_boxes_90,
+)
+from .table_detector import (
+    DetectedTableGrid,
+    build_table_data_from_grid,
+    detect_table_grids,
+    extract_tables_via_column_projection,
+    filter_clipped_edge_boxes,
+    partition_boxes_by_tables,
+    split_boxes_by_grid_dividers,
 )
 from .pipeline import ConversionResult, convert_pdf_to_docx
 from .preprocessor import (
@@ -96,15 +87,9 @@ from .schemas import (
     AdministrativeDocument,
     BodyBlock,
     FooterTable,
-    GeminiBodyBlock,
-    GeminiFooterTable,
-    GeminiHeaderTable,
-    GeminiPageExtraction,
-    GeminiTitleBlock,
     HeaderTable,
     PageStructure,
     TitleBlock,
-    gemini_extraction_to_page_structure,
     merge_page_structures,
 )
 
@@ -112,19 +97,10 @@ __all__ = [
     "AdministrativeDocument",
     "BodyBlock",
     "ConversionResult",
-    "DEFAULT_MODEL_ROTATION",
     "DetectedLine",
     "DocxBuildError",
     "DocxRenderConfig",
     "FooterTable",
-    "GeminiBodyBlock",
-    "GeminiExtractionError",
-    "GeminiExtractorConfig",
-    "GeminiFooterTable",
-    "GeminiHeaderTable",
-    "GeminiPageExtraction",
-    "GeminiTextCorrector",
-    "GeminiTitleBlock",
     "HeaderTable",
     "ImagePreprocessError",
     "LayoutSegment",
@@ -143,19 +119,26 @@ __all__ = [
     "VietOcrRecognizer",
     "build_administrative_document_from_layouts",
     "build_docx",
-    "build_model_rotation",
     "classify_page_lines",
     "collect_document_text_batch",
     "convert_pdf_to_docx",
     "denoise_and_enhance_contrast",
     "encode_image_bytes",
     "extract_red_channel_and_suppress_seal",
-    "gemini_extraction_to_page_structure",
     "group_boxes_into_lines",
     "group_lines_into_segments",
     "merge_page_structures",
     "preprocess_page_image",
     "preprocess_pdf",
     "render_pdf_to_images",
-    "split_text_dict_into_batches",
+    "DetectedTableGrid",
+    "build_table_data_from_grid",
+    "detect_and_fix_orientation",
+    "detect_table_grids",
+    "detect_vertical_text_ratio",
+    "extract_tables_via_column_projection",
+    "filter_clipped_edge_boxes",
+    "partition_boxes_by_tables",
+    "rotate_boxes_90",
+    "split_boxes_by_grid_dividers",
 ]

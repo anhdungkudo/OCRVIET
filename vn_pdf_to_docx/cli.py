@@ -4,22 +4,14 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
 import sys
 from pathlib import Path
 from typing import Optional
 
 from pydantic import ValidationError
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv(override=True)
-except ImportError:  # pragma: no cover
-    pass
-
 from .docx_builder import DocxRenderConfig
 from .exceptions import PdfToDocxError
-from .extractor import GeminiExtractorConfig
 from .ocr_layout import OcrLayoutConfig
 from .page_utils import parse_page_ranges
 from .pipeline import convert_pdf_to_docx
@@ -31,8 +23,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="vn-pdf-to-docx",
         description=(
-            "Hybrid converter for scanned Vietnamese administrative PDF/A documents: "
-            "OpenCV red-seal removal -> RapidOCR + VietOCR -> 1-Shot Gemini text correction -> DOCX."
+            "100% Offline converter for scanned Vietnamese administrative PDF/A documents: "
+            "OpenCV red-seal removal -> Auto-Rotation -> RapidOCR + VietOCR -> DOCX."
         ),
     )
     parser.add_argument("input_pdf", type=Path, help="Path to the input scanned PDF/A file.")
@@ -48,23 +40,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=200,
         help="Rasterization DPI for PyMuPDF rendering (default: 200).",
-    )
-    parser.add_argument(
-        "--model",
-        type=str,
-        default=os.environ.get("GEMINI_MODEL") or "gemini-3.8-flash",
-        help="Primary Gemini model for 1-shot text correction (default: gemini-3.8-flash).",
-    )
-    parser.add_argument(
-        "--api-key",
-        type=str,
-        default=None,
-        help="Gemini API key (falls back to GEMINI_API_KEY / GOOGLE_API_KEY env var).",
-    )
-    parser.add_argument(
-        "--skip-llm",
-        action="store_true",
-        help="Skip Gemini 1-shot text correction (output raw offline VietOCR text).",
     )
     parser.add_argument(
         "--save-json",
@@ -128,15 +103,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         result = convert_pdf_to_docx(
             pdf_path=args.input_pdf,
             output_docx_path=output_docx,
-            api_key=args.api_key,
             preprocess_config=PreprocessConfig(dpi=args.dpi),
             ocr_config=OcrLayoutConfig(dpi=args.dpi),
-            extractor_config=GeminiExtractorConfig(model=args.model),
             docx_config=DocxRenderConfig(footer_left_alignment=footer_left_align),
             page_numbers=page_numbers,
             save_debug_images_dir=args.debug_images_dir,
             save_json_path=args.save_json,
-            skip_llm_correction=args.skip_llm,
         )
         print(f"Converted successfully: {result.output_docx}")
         return 0

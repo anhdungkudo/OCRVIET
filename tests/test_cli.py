@@ -13,13 +13,11 @@ class TestCLI(unittest.TestCase):
         parser = build_arg_parser()
         args_default = parser.parse_args(["sample.pdf"])
         self.assertEqual(args_default.dpi, 200)
-        self.assertFalse(args_default.skip_llm)
 
-        args = parser.parse_args(["sample.pdf", "--pages", "1-3", "--dpi", "200", "--skip-llm"])
+        args = parser.parse_args(["sample.pdf", "--pages", "1-3", "--dpi", "200"])
         self.assertEqual(args.input_pdf, Path("sample.pdf"))
         self.assertEqual(args.pages, "1-3")
         self.assertEqual(args.dpi, 200)
-        self.assertTrue(args.skip_llm)
 
     def test_main_with_pages(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

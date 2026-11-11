@@ -23,6 +23,8 @@ from vn_pdf_to_docx.docx_builder import (
     add_header_table,
     add_title_block,
     build_docx,
+    find_next_available_docx_path,
+    is_file_write_locked,
 )
 from vn_pdf_to_docx.exceptions import DocxBuildError
 from vn_pdf_to_docx.schemas import (
@@ -635,6 +637,41 @@ class TestDocxBuilderAndCli(unittest.TestCase):
         self.assertEqual(len(entries), 2)
         self.assertTrue(entries[0]["bold"])
         self.assertTrue(entries[1]["bold"])
+
+    @unittest.skipUnless(HAS_DOCX, "python-docx is not installed in this environment.")
+    def test_build_docx_saves_sibling_copy_when_existing_target_is_locked(self) -> None:
+        from docx.document import Document as DocxDocument
+
+        doc_data = _sample_document()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            locked_target = tmp_dir / "Phan_07_XV_den_XVI.docx"
+            locked_target.write_bytes(b"locked")
+            existing_copy1 = tmp_dir / "Phan_07_XV_den_XVI (1).docx"
+            existing_copy1.write_bytes(b"already-exists")
+
+            self.assertEqual(
+                find_next_available_docx_path(locked_target),
+                tmp_dir / "Phan_07_XV_den_XVI (2).docx",
+            )
+            self.assertFalse(is_file_write_locked(locked_target))
+            self.assertFalse(is_file_write_locked(tmp_dir / "missing.docx"))
+            with patch.object(Path, "open", side_effect=PermissionError("locked")):
+                self.assertTrue(is_file_write_locked(locked_target))
+
+            real_save = DocxDocument.save
+
+            def locked_on_target_save(self_doc: DocxDocument, path_or_stream: object) -> None:
+                if Path(str(path_or_stream)) == locked_target:
+                    raise PermissionError(13, "Permission denied", str(locked_target))
+                real_save(self_doc, path_or_stream)
+
+            with patch.object(DocxDocument, "save", new=locked_on_target_save):
+                saved_path = build_docx(doc_data, locked_target)
+
+            self.assertEqual(saved_path, (tmp_dir / "Phan_07_XV_den_XVI (2).docx").resolve())
+            self.assertTrue(saved_path.is_file())
+            self.assertGreater(saved_path.stat().st_size, 5_000)
 
 
 if __name__ == "__main__":

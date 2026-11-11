@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import re
 from pathlib import Path
 from typing import Any, Literal, Optional, Union
 
@@ -9,6 +11,7 @@ from pydantic import BaseModel, Field
 
 try:
     from docx import Document
+    from docx.enum.section import WD_ORIENT, WD_SECTION
     from docx.enum.table import WD_ALIGN_VERTICAL, WD_TABLE_ALIGNMENT
     from docx.enum.text import WD_ALIGN_PARAGRAPH
     from docx.oxml import OxmlElement
@@ -17,6 +20,8 @@ try:
     _DOCX_IMPORT_ERROR: Optional[ImportError] = None
 except ImportError as exc:  # pragma: no cover - surfaced clearly at runtime when missing
     Document = None  # type: ignore[assignment]
+    WD_ORIENT = None  # type: ignore[assignment]
+    WD_SECTION = None  # type: ignore[assignment]
     WD_ALIGN_VERTICAL = None  # type: ignore[assignment]
     WD_TABLE_ALIGNMENT = None  # type: ignore[assignment]
     WD_ALIGN_PARAGRAPH = None  # type: ignore[assignment]
@@ -35,6 +40,8 @@ from .schemas import (
     TitleBlock,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class DocxRenderConfig(BaseModel):
     """Layout and typography configuration (defaults match Nghị định 30/2020/NĐ-CP)."""
@@ -45,6 +52,12 @@ class DocxRenderConfig(BaseModel):
     margin_right_cm: float = Field(default=1.5, ge=0.5)
     margin_top_cm: float = Field(default=2.0, ge=0.5)
     margin_bottom_cm: float = Field(default=2.0, ge=0.5)
+    landscape_page_width_cm: float = Field(default=29.7, gt=5.0)
+    landscape_page_height_cm: float = Field(default=21.0, gt=5.0)
+    landscape_margin_left_cm: float = Field(default=2.0, ge=0.5)
+    landscape_margin_right_cm: float = Field(default=2.0, ge=0.5)
+    landscape_margin_top_cm: float = Field(default=3.0, ge=0.5)
+    landscape_margin_bottom_cm: float = Field(default=1.5, ge=0.5)
     font_name: str = Field(default="Times New Roman")
     font_size_pt: float = Field(default=13.0, gt=6.0, le=72.0)
     first_line_indent_cm: float = Field(default=1.27, ge=0.0)
@@ -171,6 +184,44 @@ def _apply_run_formatting(
     _set_element_rfonts(run._element, font_name)
 
 
+def _apply_section_geometry(
+    section: Any,
+    base_config: DocxRenderConfig,
+    *,
+    is_landscape: bool,
+) -> DocxRenderConfig:
+    """Configure A4 Portrait or Landscape paper size & Nghị định 30 margins on a Word section."""
+    if is_landscape:
+        if WD_ORIENT is not None and hasattr(section, "orientation"):
+            section.orientation = WD_ORIENT.LANDSCAPE
+        section.page_width = Cm(base_config.landscape_page_width_cm)
+        section.page_height = Cm(base_config.landscape_page_height_cm)
+        section.left_margin = Cm(base_config.landscape_margin_left_cm)
+        section.right_margin = Cm(base_config.landscape_margin_right_cm)
+        section.top_margin = Cm(base_config.landscape_margin_top_cm)
+        section.bottom_margin = Cm(base_config.landscape_margin_bottom_cm)
+        return base_config.model_copy(
+            update={
+                "page_width_cm": base_config.landscape_page_width_cm,
+                "page_height_cm": base_config.landscape_page_height_cm,
+                "margin_left_cm": base_config.landscape_margin_left_cm,
+                "margin_right_cm": base_config.landscape_margin_right_cm,
+                "margin_top_cm": base_config.landscape_margin_top_cm,
+                "margin_bottom_cm": base_config.landscape_margin_bottom_cm,
+            }
+        )
+
+    if WD_ORIENT is not None and hasattr(section, "orientation"):
+        section.orientation = WD_ORIENT.PORTRAIT
+    section.page_width = Cm(base_config.page_width_cm)
+    section.page_height = Cm(base_config.page_height_cm)
+    section.left_margin = Cm(base_config.margin_left_cm)
+    section.right_margin = Cm(base_config.margin_right_cm)
+    section.top_margin = Cm(base_config.margin_top_cm)
+    section.bottom_margin = Cm(base_config.margin_bottom_cm)
+    return base_config
+
+
 def configure_page_and_styles(doc: Any, config: DocxRenderConfig) -> None:
     """Configure A4 paper size, Nghị định 30/2020/NĐ-CP margins, and Normal style."""
     for section in doc.sections:
@@ -231,10 +282,9 @@ def set_table_invisible_borders(table: Any) -> None:
 
 
 def _set_table_grid_borders(table: Any) -> None:
-    """Apply 'Table Grid' style with explicit single black border fallback if unavailable."""
+    """Apply 'Table Grid' style and explicit single black 4-edge borders."""
     try:
         table.style = "Table Grid"
-        return
     except KeyError:
         pass
 
@@ -541,6 +591,129 @@ def _add_compact_spacer(doc: Any, *, space_before_pt: float = 0.0, space_after_p
     spacer_run.font.size = Pt(4.0)
 
 
+_PRICE_CELL_RE = re.compile(r"^\s*\d{1,3}(?:[.,]\d{3})+(?:[.,]\d+)?\s*(?:%|đ|đồng)?\s*$", re.IGNORECASE)
+_PRICE_HEADER_KEYWORDS = ("giá", "tiền", "mức", "đơn giá", "mức giá", "thành tiền", "chi phí")
+_STT_HEADER_KEYWORDS = ("stt", "tt", "số tt")
+
+
+def _row_has_stt_or_price_structure(rows: list[list[str]], num_cols: int) -> bool:
+    if num_cols < 2 or not rows:
+        return False
+    first_row = [str(c).strip().lower() for c in rows[0] if c is not None]
+    if any(
+        k in cell
+        for cell in first_row
+        for k in (*_STT_HEADER_KEYWORDS, *_PRICE_HEADER_KEYWORDS, "danh mục", "mã tương", "tên dịch vụ")
+    ):
+        return True
+    # Check numeric price values in right-half columns
+    for col_idx in range(1, num_cols):
+        vals = [str(r[col_idx]).strip() for r in rows if len(r) > col_idx and str(r[col_idx]).strip()]
+        if any(_PRICE_CELL_RE.match(v) for v in vals):
+            return True
+    return False
+
+
+def _resolve_table_column_widths(
+    block: BodyBlock,
+    rows: list[list[str]],
+    num_cols: int,
+    config: DocxRenderConfig,
+) -> list[float]:
+    """Compute column widths in cm (Portrait `[1.2, 11.5, 3.0]` or scaled to `config.usable_width_cm`)."""
+    if block.col_widths_cm and len(block.col_widths_cm) == num_cols:
+        widths = [max(0.5, float(w)) for w in block.col_widths_cm]
+        return widths
+
+    usable = config.usable_width_cm
+    if num_cols == 3 and _row_has_stt_or_price_structure(rows, num_cols):
+        if usable <= 18.0:
+            return [1.2, 11.5, 3.0]
+        base_scale = usable / (1.2 + 11.5 + 3.0)
+        return [round(1.2 * base_scale, 2), round(11.5 * base_scale, 2), round(3.0 * base_scale, 2)]
+
+    if num_cols >= 4 and _row_has_stt_or_price_structure(rows, num_cols):
+        stt_w = 1.2 if usable <= 18.0 else round(min(2.6, usable * 0.10), 2)
+        price_w = 3.0 if usable <= 18.0 else round(usable * 0.12, 2)
+        remaining = max(2.0, usable - stt_w - price_w)
+        mid_w = remaining / float(num_cols - 2)
+        return [stt_w] + [round(mid_w, 2)] * (num_cols - 2) + [price_w]
+
+    col_width = usable / float(num_cols)
+    return [col_width] * num_cols
+
+
+def _resolve_table_header_rows(block: BodyBlock, rows: list[list[str]]) -> int:
+    if block.header_rows > 0:
+        return min(block.header_rows, len(rows))
+    if not rows:
+        return 0
+    first_cells = [str(c).strip().lower() for c in rows[0] if c is not None]
+    is_header = any(
+        k in cell
+        for cell in first_cells
+        for k in (
+            *_STT_HEADER_KEYWORDS,
+            *_PRICE_HEADER_KEYWORDS,
+            "danh mục",
+            "nội dung",
+            "tên đơn vị",
+            "mã tương",
+            "tên dịch vụ",
+            "ghi chú",
+        )
+    )
+    if not is_header:
+        return 0
+    if len(rows) >= 2:
+        second_cells = [str(c).strip() for c in rows[1] if str(c).strip()]
+        if second_cells and all(c.isdigit() and int(c) <= len(rows[0]) + 1 for c in second_cells):
+            return 2
+    return 1
+
+
+def _header_looks_like_price_col(hdr: str) -> bool:
+    low = hdr.strip().lower()
+    if not low or low.startswith("tên ") or any(
+        excl in low for excl in ("tên dịch vụ", "danh mục", "ghi chú", "nội dung")
+    ):
+        return False
+    return low in ("giá", "mức") or any(
+        k in low for k in ("mức giá", "đơn giá", "thành tiền", "số tiền", "chi phí", "giá dịch vụ")
+    )
+
+
+def _resolve_table_col_alignments(
+    block: BodyBlock,
+    rows: list[list[str]],
+    num_cols: int,
+) -> list[Any]:
+    if block.col_alignments and len(block.col_alignments) == num_cols:
+        return [_resolve_alignment(a) for a in block.col_alignments]
+
+    if _row_has_stt_or_price_structure(rows, num_cols):
+        header_cells = [str(rows[0][c]).strip().lower() if c < len(rows[0]) else "" for c in range(num_cols)]
+        aligns: list[Any] = []
+        for col_idx in range(num_cols):
+            hdr = header_cells[col_idx]
+            if col_idx == 0 and (any(k == hdr or k in hdr for k in _STT_HEADER_KEYWORDS) or "mã" in hdr or num_cols >= 3):
+                aligns.append(WD_ALIGN_PARAGRAPH.CENTER)
+            elif col_idx > 0 and (
+                _header_looks_like_price_col(hdr)
+                or any(
+                    len(r) > col_idx and _PRICE_CELL_RE.match(str(r[col_idx]).strip())
+                    for r in rows[1:]
+                )
+            ):
+                aligns.append(WD_ALIGN_PARAGRAPH.RIGHT)
+            else:
+                aligns.append(WD_ALIGN_PARAGRAPH.LEFT)
+        return aligns
+
+    default_align = _resolve_alignment(block.alignment)
+    return [default_align] * num_cols
+
+
 def _add_table_block(
     doc: Any,
     block: BodyBlock,
@@ -548,7 +721,7 @@ def _add_table_block(
     *,
     add_trailing_spacer: bool = True,
 ) -> None:
-    """Render a 2D table BodyBlock with 'Table Grid' borders and safe ragged-row padding."""
+    """Render a 2D table BodyBlock with 'Table Grid' borders, column widths, and merged spans."""
     rows = block.content
     if not isinstance(rows, list) or not rows:
         return
@@ -563,22 +736,69 @@ def _add_table_block(
     table = doc.add_table(rows=num_rows, cols=num_cols)
     _set_table_grid_borders(table)
 
-    col_width = config.usable_width_cm / float(num_cols)
-    _set_table_column_widths(table, [col_width] * num_cols)
+    col_widths = _resolve_table_column_widths(block, rows, num_cols, config)
+    _set_table_column_widths(table, col_widths)
 
-    alignment = _resolve_alignment(block.alignment)
+    header_row_count = _resolve_table_header_rows(block, rows)
+    col_alignments = _resolve_table_col_alignments(block, rows, num_cols)
+
     for row_idx, row_data in enumerate(rows):
-        for col_idx in range(num_cols):
-            raw_cell = row_data[col_idx] if col_idx < len(row_data) else ""
-            cell_text = "" if raw_cell is None else str(raw_cell)
-            cell = table.cell(row_idx, col_idx)
+        raw_spans = (
+            block.cell_colspans[row_idx]
+            if (block.cell_colspans and row_idx < len(block.cell_colspans))
+            else None
+        )
+        spans: list[int] = (
+            [max(1, int(s)) for s in raw_spans]
+            if raw_spans and sum(max(1, int(s)) for s in raw_spans) == num_cols
+            else [1] * num_cols
+        )
+
+        is_header_row = row_idx < header_row_count
+        is_merged_row = len(spans) < num_cols
+
+        col_cursor = 0
+        for span_len in spans:
+            end_col = min(num_cols - 1, col_cursor + span_len - 1)
+            cell_parts: list[str] = []
+            for c in range(col_cursor, end_col + 1):
+                if c < len(row_data) and row_data[c] is not None:
+                    part = str(row_data[c]).strip()
+                    if part:
+                        cell_parts.append(part)
+            cell_text = " ".join(cell_parts).strip()
+
+            cell = table.cell(row_idx, col_cursor)
+            if end_col > col_cursor:
+                cell.merge(table.cell(row_idx, end_col))
+                cell.width = Cm(sum(col_widths[col_cursor : end_col + 1]))
+
             cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
             _set_cell_margins(cell, top_dxa=60, bottom_dxa=60, left_dxa=90, right_dxa=90)
+
+            if is_header_row:
+                cell_align = WD_ALIGN_PARAGRAPH.CENTER
+                is_bold = bool(block.bold or row_idx == 0)
+            elif span_len > 1:
+                cell_align = WD_ALIGN_PARAGRAPH.LEFT
+                is_bold = bool(block.bold or span_len == num_cols)
+            else:
+                cell_align = col_alignments[col_cursor]
+                is_bold = bool(
+                    block.bold
+                    or (
+                        is_merged_row
+                        and span_len == 1
+                        and col_cursor == 0
+                        and bool(cell_text)
+                    )
+                )
+
             cell_lines = cell_text.splitlines() if cell_text else [""]
             entries = [
                 {
                     "text": ln,
-                    "bold": block.bold,
+                    "bold": is_bold,
                     "italic": block.italic,
                     "space_after_pt": 1.0,
                 }
@@ -587,9 +807,10 @@ def _add_table_block(
             _write_cell_paragraphs(
                 cell,
                 entries,
-                default_alignment=alignment,
+                default_alignment=cell_align,
                 config=config,
             )
+            col_cursor = end_col + 1
 
     # Prevent Word from merging adjacent tables when consecutive table blocks appear.
     if add_trailing_spacer:
@@ -841,6 +1062,47 @@ def _has_mid_document_footer(document_data: AdministrativeDocument) -> bool:
     )
 
 
+def find_next_available_docx_path(path: Path, *, max_attempts: int = 99) -> Path:
+    """Return the first non-existing sibling filename like `stem (1).docx`."""
+    for idx in range(1, max_attempts + 1):
+        candidate = path.with_name(f"{path.stem} ({idx}){path.suffix}")
+        if not candidate.exists():
+            return candidate
+    return path.with_name(f"{path.stem} ({max_attempts + 1}){path.suffix}")
+
+
+def is_file_write_locked(path: Path) -> bool:
+    """Return True when an existing file is currently write-locked (e.g., open in Word)."""
+    if not path.exists() or not path.is_file():
+        return False
+    try:
+        with path.open("r+b"):
+            return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _save_docx_with_fallback(doc: Any, out_path: Path) -> Path:
+    """Save Word document, falling back to a sibling filename if target is locked by Word."""
+    try:
+        doc.save(str(out_path))
+        return out_path.resolve()
+    except PermissionError as first_exc:
+        if not out_path.exists():
+            raise
+        fallback_path = find_next_available_docx_path(out_path)
+        doc.save(str(fallback_path))
+        logger.warning(
+            "Tệp đích '%s' đang mở hoặc bị khóa ghi (%s); tự động lưu bản mới tại '%s'.",
+            out_path,
+            first_exc,
+            fallback_path,
+        )
+        return fallback_path.resolve()
+
+
 def build_docx(
     document_data: AdministrativeDocument,
     output_path: Union[str, Path],
@@ -849,7 +1111,7 @@ def build_docx(
     """Build and save a formatted Microsoft Word (.docx) from an AdministrativeDocument.
 
     Args:
-        document_data: Structured Vietnamese administrative document extracted by Gemini.
+        document_data: Structured Vietnamese administrative document from local OCR & layout analysis.
         output_path: Destination `.docx` file path.
         config: Optional layout/typography overrides.
 
@@ -871,18 +1133,50 @@ def build_docx(
     try:
         doc = Document()
         configure_page_and_styles(doc, cfg)
-        if _has_mid_document_footer(document_data):
+        has_landscape_pages = any(page.is_landscape for page in document_data.pages)
+        if _has_mid_document_footer(document_data) or has_landscape_pages:
             ordered_pages = sorted(document_data.pages, key=lambda p: p.page_number)
+            current_landscape = ordered_pages[0].is_landscape if ordered_pages else False
+            active_cfg = _apply_section_geometry(
+                doc.sections[-1], cfg, is_landscape=current_landscape
+            )
             for idx, page in enumerate(ordered_pages):
-                if idx > 0 and (
-                    (ordered_pages[idx - 1].footer_table is not None and not ordered_pages[idx - 1].footer_table.is_empty())
-                    or (page.header_table is not None and not page.header_table.is_empty())
-                ):
-                    doc.add_page_break()
-                add_header_table(doc, page.header_table, cfg)
-                add_title_block(doc, page.title_block, cfg)
-                add_body_blocks(doc, page.body_blocks, cfg)
-                add_footer_table(doc, page.footer_table, cfg)
+                if idx > 0:
+                    if page.is_landscape != current_landscape:
+                        new_section = (
+                            doc.add_section(WD_SECTION.NEW_PAGE)
+                            if WD_SECTION is not None
+                            else doc.add_section()
+                        )
+                        current_landscape = page.is_landscape
+                        active_cfg = _apply_section_geometry(
+                            new_section, cfg, is_landscape=current_landscape
+                        )
+                    elif (
+                        (ordered_pages[idx - 1].footer_table is not None and not ordered_pages[idx - 1].footer_table.is_empty())
+                        or (page.header_table is not None and not page.header_table.is_empty())
+                    ):
+                        doc.add_page_break()
+
+                page_header = (
+                    page.header_table
+                    if page.header_table is not None
+                    else (document_data.header_table if idx == 0 else None)
+                )
+                page_title = (
+                    page.title_block
+                    if page.title_block is not None
+                    else (document_data.title_block if idx == 0 else None)
+                )
+                page_footer = (
+                    page.footer_table
+                    if page.footer_table is not None
+                    else (document_data.footer_table if idx == len(ordered_pages) - 1 else None)
+                )
+                add_header_table(doc, page_header, active_cfg)
+                add_title_block(doc, page_title, active_cfg)
+                add_body_blocks(doc, page.body_blocks, active_cfg)
+                add_footer_table(doc, page_footer, active_cfg)
         else:
             add_header_table(doc, document_data.header_table, cfg)
             add_title_block(doc, document_data.title_block, cfg)
@@ -891,8 +1185,7 @@ def build_docx(
 
         if out_path.parent:
             out_path.parent.mkdir(parents=True, exist_ok=True)
-        doc.save(str(out_path))
-        return out_path.resolve()
+        return _save_docx_with_fallback(doc, out_path)
     except DocxBuildError:
         raise
     except Exception as exc:
