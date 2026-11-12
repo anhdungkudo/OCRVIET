@@ -53,7 +53,17 @@ class OcrLayoutConfig(BaseModel):
         description="Padding (px) added around detected text boxes before VietOCR recognition.",
     )
     vietocr_config_name: str = Field(default="vgg_transformer", min_length=1)
-    vietocr_device: str = Field(default="cpu", min_length=1)
+    vietocr_device: str = Field(default="auto", min_length=1)
+    vietocr_batch_size: int = Field(
+        default=64,
+        ge=1,
+        le=256,
+        description="Maximum number of cropped text boxes per VietOCR batch.",
+    )
+    vietocr_use_fp16: bool = Field(
+        default=False,
+        description="Optional FP16 autocast on CUDA GPU (disabled by default to preserve exact FP32 accuracy).",
+    )
     vietocr_weights: Optional[str] = Field(default=None)
     auto_rotate_landscape: bool = Field(
         default=True,

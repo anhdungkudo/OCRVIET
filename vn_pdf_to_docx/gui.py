@@ -81,7 +81,7 @@ from .docx_builder import (
     is_file_write_locked,
 )
 from .exceptions import PdfToDocxError
-from .ocr_layout import OcrLayoutConfig
+from .ocr_layout import OcrLayoutConfig, describe_vietocr_device
 from .page_utils import parse_page_ranges
 from .pipeline import ConversionResult, convert_pdf_to_docx
 from .preprocessor import PreprocessConfig
@@ -267,8 +267,9 @@ class ConversionWorker(QThread):
         footer_align: str,
         suppress_red: bool,
         page_numbers: Optional[list[int]],
-        save_json: Optional[Path],
-        save_debug_dir: Optional[Path],
+        vietocr_device: str = "auto",
+        vietocr_batch_size: int = 64,
+        vietocr_use_fp16: bool = False,
     ) -> None:
         super().__init__()
         self.pdf_path = pdf_path
@@ -277,8 +278,9 @@ class ConversionWorker(QThread):
         self.footer_align = footer_align
         self.suppress_red = suppress_red
         self.page_numbers = page_numbers
-        self.save_json = save_json
-        self.save_debug_dir = save_debug_dir
+        self.vietocr_device = vietocr_device
+        self.vietocr_batch_size = vietocr_batch_size
+        self.vietocr_use_fp16 = vietocr_use_fp16
         self._is_cancelled = False
 
     def cancel(self) -> None:
@@ -296,7 +298,12 @@ class ConversionWorker(QThread):
                 red_suppression_strength=1.3 if self.suppress_red else 0.0,
                 nlm_h=10.0 if self.suppress_red else 0.0,
             )
-            ocr_cfg = OcrLayoutConfig(dpi=self.dpi)
+            ocr_cfg = OcrLayoutConfig(
+                dpi=self.dpi,
+                vietocr_device=self.vietocr_device,
+                vietocr_batch_size=self.vietocr_batch_size,
+                vietocr_use_fp16=self.vietocr_use_fp16,
+            )
             doc_cfg = DocxRenderConfig(footer_left_alignment=self.footer_align)
 
             def detailed_cb(stage: str, cur: int, tot: int, msg: str) -> None:
@@ -330,8 +337,6 @@ class ConversionWorker(QThread):
                 ocr_config=ocr_cfg,
                 docx_config=doc_cfg,
                 page_numbers=self.page_numbers,
-                save_debug_images_dir=self.save_debug_dir,
-                save_json_path=self.save_json,
                 detailed_progress_callback=detailed_cb,
             )
 
@@ -464,6 +469,7 @@ class MainWindow(QMainWindow):
         self.spn_dpi.setRange(72, 600)
         self.spn_dpi.setValue(200)
         self.spn_dpi.setSuffix(" DPI")
+        self.spn_dpi.setMinimumWidth(95)
         settings_layout.addWidget(self.spn_dpi, 0, 1)
 
         align_box = QHBoxLayout()
@@ -484,12 +490,6 @@ class MainWindow(QMainWindow):
         self.chk_open_word = QCheckBox("Tự động mở file Word khi hoàn tất")
         self.chk_open_word.setChecked(True)
         opt_box.addWidget(self.chk_open_word)
-
-        self.chk_save_json = QCheckBox("Lưu cấu trúc JSON")
-        opt_box.addWidget(self.chk_save_json)
-
-        self.chk_save_debug = QCheckBox("Lưu ảnh debug")
-        opt_box.addWidget(self.chk_save_debug)
 
         settings_layout.addLayout(opt_box, 1, 1, 1, 2)
 
@@ -751,14 +751,6 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, "Lỗi khoảng trang", str(exc))
                 return
 
-        save_json: Optional[Path] = None
-        if self.chk_save_json.isChecked():
-            save_json = output_docx.with_suffix(".json")
-
-        save_debug: Optional[Path] = None
-        if self.chk_save_debug.isChecked():
-            save_debug = output_docx.parent / f"{output_docx.stem}_debug_images"
-
         # Update UI state for running
         self.btn_start.setEnabled(False)
         self.btn_cancel.setEnabled(True)
@@ -769,8 +761,9 @@ class MainWindow(QMainWindow):
         self.lbl_status.setStyleSheet("font-weight: bold; color: #1a73e8;")
 
         pages_desc = f"{len(page_numbers)} trang ({page_numbers})" if page_numbers else "Toàn bộ trang"
+        device_label = describe_vietocr_device("auto")
         self._append_log(
-            f"Bắt đầu: {pdf_path.name} | Offline VietOCR | DPI: {dpi} | Trang: {pages_desc} | Căn lề Nơi nhận: {footer_align}",
+            f"Bắt đầu: {pdf_path.name} | VietOCR [{device_label}, batch=64] | DPI: {dpi} | Trang: {pages_desc} | Căn lề Nơi nhận: {footer_align}",
             "INFO",
         )
 
@@ -781,8 +774,6 @@ class MainWindow(QMainWindow):
             footer_align=footer_align,
             suppress_red=suppress_red,
             page_numbers=page_numbers,
-            save_json=save_json,
-            save_debug_dir=save_debug,
         )
         self.worker.sig_progress.connect(self._on_worker_progress)
         self.worker.sig_log.connect(self._on_worker_log)

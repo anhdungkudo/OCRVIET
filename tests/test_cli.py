@@ -14,10 +14,14 @@ class TestCLI(unittest.TestCase):
         args_default = parser.parse_args(["sample.pdf"])
         self.assertEqual(args_default.dpi, 200)
 
-        args = parser.parse_args(["sample.pdf", "--pages", "1-3", "--dpi", "200"])
+        args = parser.parse_args(
+            ["sample.pdf", "--pages", "1-3", "--dpi", "200", "--device", "cpu", "--batch-size", "16"]
+        )
         self.assertEqual(args.input_pdf, Path("sample.pdf"))
         self.assertEqual(args.pages, "1-3")
         self.assertEqual(args.dpi, 200)
+        self.assertEqual(args.device, "cpu")
+        self.assertEqual(args.batch_size, 16)
 
     def test_main_with_pages(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

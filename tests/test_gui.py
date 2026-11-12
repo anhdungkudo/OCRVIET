@@ -54,6 +54,8 @@ class TestMainWindow(unittest.TestCase):
         self.assertFalse(hasattr(self.window, "txt_api_key"))
         self.assertFalse(hasattr(self.window, "cmb_model"))
         self.assertFalse(hasattr(self.window, "chk_skip_llm"))
+        self.assertFalse(hasattr(self.window, "chk_save_json"))
+        self.assertFalse(hasattr(self.window, "chk_save_debug"))
 
     def test_page_mode_toggle(self) -> None:
         self.window.rad_custom_pages.setChecked(True)
@@ -223,8 +225,6 @@ class TestConversionWorker(unittest.TestCase):
                 footer_align="center",
                 suppress_red=True,
                 page_numbers=[1],
-                save_json=None,
-                save_debug_dir=None,
             )
 
             progress_events: list[tuple[int, str]] = []
@@ -251,8 +251,6 @@ class TestConversionWorker(unittest.TestCase):
                 footer_align="center",
                 suppress_red=True,
                 page_numbers=None,
-                save_json=None,
-                save_debug_dir=None,
             )
 
             finish_event: list[tuple[bool, str]] = []
@@ -280,8 +278,6 @@ class TestConversionWorker(unittest.TestCase):
                 footer_align="center",
                 suppress_red=True,
                 page_numbers=None,
-                save_json=None,
-                save_debug_dir=None,
             )
 
             def fake_convert(*args, **kwargs):

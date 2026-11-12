@@ -29,9 +29,11 @@ from vn_pdf_to_docx.ocr_layout import (
     classify_page_lines,
     cluster_line_boxes,
     collect_document_text_batch,
+    describe_vietocr_device,
     group_boxes_into_lines,
     group_lines_into_segments,
     parse_rapidocr_boxes,
+    resolve_vietocr_device,
 )
 from vn_pdf_to_docx.preprocessor import PreprocessedPage
 
@@ -811,6 +813,69 @@ class TestOcrLayout(unittest.TestCase):
             self.assertEqual(blocks[0].type, "two_column_table")
             self.assertEqual(blocks[-1].type, "two_column_table")
             self.assertTrue(any(b.type == "paragraph" and b.first_line_indent for b in blocks))
+
+    def test_resolve_vietocr_device_auto_and_explicit(self) -> None:
+        fake_torch_gpu = SimpleNamespace(
+            cuda=SimpleNamespace(
+                is_available=lambda: True,
+                get_device_name=lambda idx=0: "NVIDIA GeForce GTX 1650",
+            )
+        )
+        fake_torch_cpu = SimpleNamespace(
+            cuda=SimpleNamespace(is_available=lambda: False)
+        )
+
+        with patch.dict(sys.modules, {"torch": fake_torch_gpu}):
+            self.assertEqual(resolve_vietocr_device("auto"), "cuda:0")
+            self.assertEqual(resolve_vietocr_device("cuda"), "cuda:0")
+            self.assertEqual(resolve_vietocr_device("cpu"), "cpu")
+            self.assertEqual(describe_vietocr_device("auto"), "GPU CUDA (NVIDIA GeForce GTX 1650)")
+
+        with patch.dict(sys.modules, {"torch": fake_torch_cpu}):
+            self.assertEqual(resolve_vietocr_device("auto"), "cpu")
+            self.assertEqual(describe_vietocr_device("auto"), "CPU")
+
+    def test_vietocr_recognize_boxes_batches_and_falls_back_on_error(self) -> None:
+        page_img = np.full((120, 400, 3), 255, dtype=np.uint8)
+        boxes = [
+            TextBox(x_min=10, y_min=10, x_max=80, y_max=35),
+            TextBox(x_min=90, y_min=10, x_max=160, y_max=35),
+            TextBox(x_min=10, y_min=50, x_max=80, y_max=75),
+        ]
+
+        # 1. Batched predict_batch chunked by batch_size=2
+        batch_calls: list[int] = []
+
+        class BatchPredictor:
+            def predict_batch(self, imgs):
+                batch_calls.append(len(imgs))
+                # Include decomposed Unicode to ensure NFC normalization runs
+                return ["Co\u0323ng" if i == 0 else f"dong_{i}" for i in range(len(imgs))]
+
+            def predict(self, img):
+                raise AssertionError("Single predict should not run when predict_batch succeeds")
+
+        rec = VietOcrRecognizer(batch_size=2, predictor=BatchPredictor())
+        texts = rec.recognize_boxes(page_img, boxes, padding_px=2)
+        self.assertEqual(batch_calls, [2, 1])
+        self.assertEqual(texts, ["Cọng", "dong_1", "Cọng"])
+
+        # 2. If predict_batch raises (e.g. simulated CUDA OOM), falls back to single predict per chunk
+        single_calls = 0
+
+        class FallbackPredictor:
+            def predict_batch(self, imgs):
+                raise RuntimeError("CUDA out of memory")
+
+            def predict(self, img):
+                nonlocal single_calls
+                single_calls += 1
+                return f"fallback_{single_calls}"
+
+        rec_fb = VietOcrRecognizer(batch_size=2, predictor=FallbackPredictor())
+        fb_texts = rec_fb.recognize_boxes(page_img, boxes, padding_px=2)
+        self.assertEqual(single_calls, 3)
+        self.assertEqual(fb_texts, ["fallback_1", "fallback_2", "fallback_3"])
 
 
 if __name__ == "__main__":

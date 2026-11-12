@@ -42,18 +42,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Rasterization DPI for PyMuPDF rendering (default: 200).",
     )
     parser.add_argument(
-        "--save-json",
-        type=Path,
-        default=None,
-        help="Optional path to save the extracted structured JSON payload.",
-    )
-    parser.add_argument(
-        "--debug-images-dir",
-        type=Path,
-        default=None,
-        help="Optional directory to dump preprocessed 200-DPI grayscale PNG pages.",
-    )
-    parser.add_argument(
         "--footer-left-align",
         choices=("center", "left"),
         default=None,
@@ -69,6 +57,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Specific page(s) to convert, e.g. '1', '1-5', '1,3,5' (default: all pages).",
+    )
+    parser.add_argument(
+        "--device",
+        choices=("auto", "cpu", "cuda"),
+        default="auto",
+        help="VietOCR compute device: 'auto' prefers CUDA GPU when available (default: auto).",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=64,
+        help="Maximum cropped text boxes processed per VietOCR batch (default: 64).",
     )
     parser.add_argument(
         "-v",
@@ -104,11 +104,13 @@ def main(argv: Optional[list[str]] = None) -> int:
             pdf_path=args.input_pdf,
             output_docx_path=output_docx,
             preprocess_config=PreprocessConfig(dpi=args.dpi),
-            ocr_config=OcrLayoutConfig(dpi=args.dpi),
+            ocr_config=OcrLayoutConfig(
+                dpi=args.dpi,
+                vietocr_device=args.device,
+                vietocr_batch_size=args.batch_size,
+            ),
             docx_config=DocxRenderConfig(footer_left_alignment=footer_left_align),
             page_numbers=page_numbers,
-            save_debug_images_dir=args.debug_images_dir,
-            save_json_path=args.save_json,
         )
         print(f"Converted successfully: {result.output_docx}")
         return 0

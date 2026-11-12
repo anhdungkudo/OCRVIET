@@ -57,10 +57,12 @@ from .ocr_layout import (
     build_administrative_document_from_layouts,
     classify_page_lines,
     collect_document_text_batch,
+    describe_vietocr_device,
     detect_and_fix_orientation,
     detect_vertical_text_ratio,
     group_boxes_into_lines,
     group_lines_into_segments,
+    resolve_vietocr_device,
     rotate_boxes_90,
 )
 from .table_detector import (
@@ -136,9 +138,11 @@ __all__ = [
     "detect_and_fix_orientation",
     "detect_table_grids",
     "detect_vertical_text_ratio",
+    "describe_vietocr_device",
     "extract_tables_via_column_projection",
     "filter_clipped_edge_boxes",
     "partition_boxes_by_tables",
+    "resolve_vietocr_device",
     "rotate_boxes_90",
     "split_boxes_by_grid_dividers",
 ]

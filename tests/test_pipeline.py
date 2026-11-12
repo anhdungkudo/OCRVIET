@@ -1,8 +1,7 @@
-"""Tests for end-to-end Hybrid pipeline: PyMuPDF+OpenCV -> RapidOCR+VietOCR -> 1-Shot Text -> DOCX."""
+"""Tests for end-to-end 100% Offline pipeline: PyMuPDF+OpenCV -> RapidOCR+VietOCR -> DOCX."""
 
 from __future__ import annotations
 
-import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,7 +17,6 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
 
 import vn_pdf_to_docx.pipeline as pipeline_mod
-from vn_pdf_to_docx.exceptions import PdfToDocxError
 from vn_pdf_to_docx.ocr_layout import LayoutSegment, PageLayoutResult
 from vn_pdf_to_docx.pipeline import convert_pdf_to_docx
 from vn_pdf_to_docx.preprocessor import PreprocessConfig
@@ -85,48 +83,12 @@ def _sample_page_layouts() -> list[PageLayoutResult]:
 class TestPipeline(unittest.TestCase):
     """Verify 3-step offline pipeline execution, error wrapping, and artifacts."""
 
-    def test_save_debug_images_dir_existing_file_raises_pdf_to_docx_error(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_dir = Path(tmp)
-            pdf_path = tmp_dir / "sample.pdf"
-            _write_two_page_pdf(pdf_path)
-
-            blocking_file = tmp_dir / "not_a_directory"
-            blocking_file.write_text("occupied", encoding="utf-8")
-
-            with self.assertRaises(PdfToDocxError) as ctx:
-                convert_pdf_to_docx(
-                    pdf_path,
-                    tmp_dir / "out.docx",
-                    preprocess_config=PreprocessConfig(dpi=100),
-                    save_debug_images_dir=blocking_file,
-                )
-            self.assertIn("debug images directory", str(ctx.exception))
-
-    def test_save_debug_images_dir_permission_error_raises_pdf_to_docx_error(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_dir = Path(tmp)
-            pdf_path = tmp_dir / "sample.pdf"
-            _write_two_page_pdf(pdf_path)
-
-            with patch.object(Path, "mkdir", side_effect=PermissionError("access denied")):
-                with self.assertRaises(PdfToDocxError) as ctx:
-                    convert_pdf_to_docx(
-                        pdf_path,
-                        tmp_dir / "out.docx",
-                        preprocess_config=PreprocessConfig(dpi=100),
-                        save_debug_images_dir=tmp_dir / "debug_out",
-                    )
-            self.assertIn("debug images directory", str(ctx.exception))
-
     def test_offline_pipeline_processes_all_pages_and_builds_real_docx(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_dir = Path(tmp)
             pdf_path = tmp_dir / "sample.pdf"
             _write_two_page_pdf(pdf_path)
 
-            debug_dir = tmp_dir / "debug_imgs"
-            json_path = tmp_dir / "nested" / "extracted.json"
             out_docx = tmp_dir / "result.docx"
 
             fake_analyzer = MagicMock()
@@ -139,20 +101,15 @@ class TestPipeline(unittest.TestCase):
                     pdf_path,
                     out_docx,
                     preprocess_config=PreprocessConfig(dpi=100, image_format="jpeg"),
-                    save_debug_images_dir=debug_dir,
-                    save_json_path=json_path,
                     progress_callback=lambda stage, cur, tot: events.append((stage, cur, tot)),
                 )
 
-            # Debug PNGs written for both pages
-            self.assertTrue((debug_dir / "page_001_preprocessed.png").read_bytes().startswith(b"\x89PNG"))
-            self.assertTrue((debug_dir / "page_002_preprocessed.png").exists())
-
-            # JSON persisted with VietOCR texts directly
-            self.assertTrue(json_path.exists())
-            loaded = json.loads(json_path.read_text(encoding="utf-8"))
-            self.assertEqual(loaded["total_pages"], 2)
-            self.assertEqual(loaded["body_blocks"][2]["content"], "Điểu 1. Quy định chung ngày O5/O3/2O2O.")
+            # Document structure populated directly from VietOCR layouts
+            self.assertEqual(result.document.total_pages, 2)
+            self.assertEqual(
+                result.document.body_blocks[2].content,
+                "Điểu 1. Quy định chung ngày O5/O3/2O2O.",
+            )
 
             # Real DOCX file built with invisible 2-col tables and aligned paragraphs
             self.assertTrue(result.output_docx.exists())
@@ -168,28 +125,6 @@ class TestPipeline(unittest.TestCase):
                 events,
                 [("preprocessed", 2, 2), ("ocr", 2, 2), ("extracted", 2, 2), ("completed", 2, 2)],
             )
-
-    def test_save_json_path_error_raises_pdf_to_docx_error(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_dir = Path(tmp)
-            pdf_path = tmp_dir / "sample.pdf"
-            _write_two_page_pdf(pdf_path)
-
-            occupied_dir = tmp_dir / "occupied_dir"
-            occupied_dir.mkdir()
-
-            fake_analyzer = MagicMock()
-            fake_analyzer.process_document.return_value = _sample_page_layouts()
-
-            with patch.object(pipeline_mod, "LocalOcrLayoutAnalyzer", return_value=fake_analyzer):
-                with self.assertRaises(PdfToDocxError) as ctx:
-                    convert_pdf_to_docx(
-                        pdf_path,
-                        tmp_dir / "out.docx",
-                        preprocess_config=PreprocessConfig(dpi=100),
-                        save_json_path=occupied_dir,
-                    )
-            self.assertIn("structured JSON", str(ctx.exception))
 
     def test_pipeline_emits_warning_when_docx_saved_to_alternate_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -510,19 +510,75 @@ def _compat_torch_load_for_vietocr() -> Iterator[None]:
         torch.load = orig_load  # type: ignore[assignment]
 
 
+def resolve_vietocr_device(requested_device: str = "auto") -> str:
+    """Resolve `'auto'` to `'cuda:0'` when PyTorch CUDA is available, else `'cpu'`."""
+    normalized = (requested_device or "auto").strip()
+    lower = normalized.lower()
+    if lower in ("auto", "gpu"):
+        try:
+            import torch  # type: ignore[import-not-found]
+
+            if torch.cuda.is_available():
+                return "cuda:0"
+        except Exception:
+            pass
+        return "cpu"
+    if lower == "cuda":
+        return "cuda:0"
+    return normalized
+
+
+def describe_vietocr_device(requested_device: str = "auto") -> str:
+    """Return a human-readable runtime label such as `'GPU CUDA (NVIDIA GeForce GTX 1650)'` or `'CPU'`."""
+    resolved = resolve_vietocr_device(requested_device)
+    if resolved.lower().startswith("cuda"):
+        try:
+            import torch  # type: ignore[import-not-found]
+
+            if torch.cuda.is_available():
+                idx = 0
+                if ":" in resolved:
+                    try:
+                        idx = int(resolved.split(":", 1)[1])
+                    except ValueError:
+                        idx = 0
+                gpu_name = torch.cuda.get_device_name(idx)
+                return f"GPU CUDA ({gpu_name})"
+        except Exception:
+            pass
+        return f"GPU ({resolved})"
+    return "CPU"
+
+
+def _clear_cuda_cache() -> None:
+    """Release cached PyTorch CUDA memory after an OOM or batch fallback."""
+    try:
+        import torch  # type: ignore[import-not-found]
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
 class VietOcrRecognizer:
-    """Sequential CPU wrapper around `vietocr` (`vgg_transformer`)."""
+    """Batched GPU/CPU wrapper around `vietocr` (`vgg_transformer`)."""
 
     def __init__(
         self,
         *,
         config_name: str = "vgg_transformer",
-        device: str = "cpu",
+        device: str = "auto",
+        batch_size: int = 64,
+        use_fp16: bool = False,
         weights: Optional[str] = None,
         predictor: Optional[Any] = None,
     ) -> None:
         self.config_name = config_name
-        self.device = device
+        self.requested_device = device
+        self.device = resolve_vietocr_device(device)
+        self.batch_size = max(1, int(batch_size))
+        self.use_fp16 = bool(use_fp16)
         self.weights = weights
 
         if predictor is not None:
@@ -548,20 +604,37 @@ class VietOcrRecognizer:
 
         try:
             cfg = _load_vietocr_config(config_name, Cfg)
-            cfg["device"] = device
+            cfg["device"] = self.device
             if "cnn" in cfg and isinstance(cfg["cnn"], dict):
                 cfg["cnn"]["pretrained"] = False
             if weights:
                 cfg["weights"] = weights
             elif isinstance(cfg.get("weights"), str):
                 cfg["weights"] = _resolve_local_vietocr_weights(cfg["weights"])
-            with _compat_torch_load_for_vietocr():
-                self._predictor = Predictor(cfg)
+            try:
+                with _compat_torch_load_for_vietocr():
+                    self._predictor = Predictor(cfg)
+            except Exception as cuda_exc:
+                if (
+                    self.device.lower().startswith("cuda")
+                    and (device or "").strip().lower() in ("auto", "gpu")
+                ):
+                    logger.warning(
+                        "CUDA VietOCR init failed (%s); falling back to CPU.",
+                        cuda_exc,
+                    )
+                    _clear_cuda_cache()
+                    self.device = "cpu"
+                    cfg["device"] = "cpu"
+                    with _compat_torch_load_for_vietocr():
+                        self._predictor = Predictor(cfg)
+                else:
+                    raise
         except LocalOcrError:
             raise
         except Exception as exc:
             raise LocalOcrError(
-                f"Failed to initialize VietOCR predictor ({config_name}, {device}): {exc}"
+                f"Failed to initialize VietOCR predictor ({config_name}, {self.device}): {exc}"
             ) from exc
 
     def recognize_box(
@@ -584,6 +657,176 @@ class VietOcrRecognizer:
         except Exception as exc:
             raise LocalOcrError(f"VietOCR recognition failed on box {box}: {exc}") from exc
         return normalize_vietnamese_text(str(raw_text)) if raw_text is not None else ""
+
+    def _can_use_fast_gpu_batch(self) -> bool:
+        """Return True when CUDA GPU-native greedy decoding + FP16 can run safely."""
+        if not self.device.lower().startswith("cuda"):
+            return False
+        pred = self._predictor
+        cfg = getattr(pred, "config", None)
+        if not isinstance(cfg, dict):
+            return False
+        if bool(cfg.get("predictor", {}).get("beamsearch", False)):
+            return False
+        return (
+            hasattr(pred, "model")
+            and hasattr(pred, "vocab")
+            and isinstance(cfg.get("dataset"), dict)
+        )
+
+    def _predict_batch_gpu_fast(self, pil_images: Sequence[Any]) -> list[str]:
+        """Run VietOCR batch decoding purely on CUDA GPU (no per-step `.to('cpu')`) with optional FP16."""
+        import torch  # type: ignore[import-not-found]
+        from collections import defaultdict
+        from vietocr.tool.translate import process_input
+
+        pred = self._predictor
+        cfg = pred.config
+        dataset_cfg = cfg["dataset"]
+        img_h = int(dataset_cfg["image_height"])
+        min_w = int(dataset_cfg["image_min_width"])
+        max_w = int(dataset_cfg["image_max_width"])
+        device = torch.device(self.device)
+        model = pred.model
+        vocab = pred.vocab
+        model.eval()
+
+        bucket: dict[int, list[Any]] = defaultdict(list)
+        bucket_idx: dict[int, list[int]] = defaultdict(list)
+        for idx, img in enumerate(pil_images):
+            tensor = process_input(img, img_h, min_w, max_w)
+            width_key = int(tensor.shape[-1])
+            bucket[width_key].append(tensor)
+            bucket_idx[width_key].append(idx)
+
+        outputs = [""] * len(pil_images)
+        sos_token = 1
+        eos_token = 2
+        max_seq_length = 128
+
+        with torch.inference_mode():
+            with torch.amp.autocast("cuda", dtype=torch.float16, enabled=self.use_fp16):
+                for width_key, tensors in bucket.items():
+                    batch = torch.cat(tensors, dim=0).to(device, non_blocking=True)
+                    batch_n = int(batch.shape[0])
+                    src = model.cnn(batch)
+                    memory = model.transformer.forward_encoder(src)
+
+                    tgt_inp = torch.full(
+                        (1, batch_n),
+                        sos_token,
+                        dtype=torch.long,
+                        device=device,
+                    )
+                    finished = torch.zeros(batch_n, dtype=torch.bool, device=device)
+
+                    for _ in range(max_seq_length):
+                        logits, memory = model.transformer.forward_decoder(tgt_inp, memory)
+                        next_tokens = torch.argmax(logits[:, -1, :], dim=-1)
+                        tgt_inp = torch.cat([tgt_inp, next_tokens.unsqueeze(0)], dim=0)
+                        finished = finished | (next_tokens == eos_token)
+                        if bool(finished.all()):
+                            break
+
+                    token_lists = tgt_inp.transpose(0, 1).tolist()
+                    decoded = vocab.batch_decode(token_lists)
+                    for pos, orig_idx in enumerate(bucket_idx[width_key]):
+                        outputs[orig_idx] = decoded[pos]
+
+        return outputs
+
+    def recognize_boxes(
+        self,
+        image: np.ndarray,
+        boxes: Sequence[TextBox],
+        *,
+        padding_px: int = 3,
+        color_order: Literal["RGB", "BGR"] = "RGB",
+        batch_size: Optional[int] = None,
+    ) -> list[str]:
+        """Crop `boxes` from `image` and run batched VietOCR recognition with per-box fallback."""
+        if not boxes:
+            return []
+
+        predict_batch_fn = getattr(self._predictor, "predict_batch", None)
+        use_fast_gpu = self._can_use_fast_gpu_batch()
+        if (
+            (len(boxes) == 1 and not use_fast_gpu)
+            or (not use_fast_gpu and not callable(predict_batch_fn))
+            or "recognize_box" in getattr(self, "__dict__", {})
+        ):
+            return [
+                self.recognize_box(
+                    image,
+                    box,
+                    padding_px=padding_px,
+                    color_order=color_order,
+                )
+                for box in boxes
+            ]
+
+        pil_images = [
+            _crop_to_pil_rgb(
+                image,
+                box,
+                padding_px=padding_px,
+                color_order=color_order,
+            )
+            for box in boxes
+        ]
+        chunk_size = max(1, int(batch_size if batch_size is not None else self.batch_size))
+        results: list[str] = []
+
+        for start in range(0, len(pil_images), chunk_size):
+            chunk_imgs = pil_images[start : start + chunk_size]
+            chunk_boxes = boxes[start : start + chunk_size]
+            raw_texts: Optional[list[Any]] = None
+
+            if use_fast_gpu:
+                try:
+                    raw_texts = self._predict_batch_gpu_fast(chunk_imgs)
+                except Exception as gpu_exc:
+                    logger.warning(
+                        "Fast GPU VietOCR batch failed on %d boxes (%s); falling back.",
+                        len(chunk_imgs),
+                        gpu_exc,
+                    )
+                    _clear_cuda_cache()
+                    raw_texts = None
+
+            if raw_texts is None and callable(predict_batch_fn):
+                try:
+                    raw_texts = predict_batch_fn(chunk_imgs)
+                except Exception as batch_exc:
+                    logger.warning(
+                        "VietOCR predict_batch failed on chunk of %d boxes (%s); falling back to single-box predict.",
+                        len(chunk_imgs),
+                        batch_exc,
+                    )
+                    _clear_cuda_cache()
+                    raw_texts = None
+
+            if raw_texts is not None and len(raw_texts) == len(chunk_imgs):
+                for raw_text in raw_texts:
+                    results.append(
+                        normalize_vietnamese_text(str(raw_text))
+                        if raw_text is not None
+                        else ""
+                    )
+            else:
+                for img, box in zip(chunk_imgs, chunk_boxes):
+                    try:
+                        raw_text = self._predictor.predict(img)
+                    except Exception as exc:
+                        raise LocalOcrError(
+                            f"VietOCR recognition failed on box {box}: {exc}"
+                        ) from exc
+                    results.append(
+                        normalize_vietnamese_text(str(raw_text))
+                        if raw_text is not None
+                        else ""
+                    )
+        return results
 
 
 def group_boxes_into_lines(
@@ -2000,18 +2243,12 @@ def detect_and_fix_orientation(
     ccw_top_boxes, ccw_bot_boxes = _select_orientation_probe_boxes(
         ccw_boxes, img_width=ccw_w, img_height=ccw_h
     )
-    ccw_top_texts = [
-        recognizer.recognize_box(
-            img_ccw, b, padding_px=config.crop_padding_px, color_order=color_order
-        )
-        for b in ccw_top_boxes
-    ]
-    ccw_bot_texts = [
-        recognizer.recognize_box(
-            img_ccw, b, padding_px=config.crop_padding_px, color_order=color_order
-        )
-        for b in ccw_bot_boxes
-    ]
+    ccw_top_texts = _recognize_box_list(
+        img_ccw, ccw_top_boxes, recognizer=recognizer, config=config, color_order=color_order
+    )
+    ccw_bot_texts = _recognize_box_list(
+        img_ccw, ccw_bot_boxes, recognizer=recognizer, config=config, color_order=color_order
+    )
     score_ccw = score_landscape_orientation_texts(
         ccw_top_texts, bottom_texts=ccw_bot_texts
     )
@@ -2022,18 +2259,12 @@ def detect_and_fix_orientation(
     cw_top_boxes, cw_bot_boxes = _select_orientation_probe_boxes(
         cw_boxes, img_width=cw_w, img_height=cw_h
     )
-    cw_top_texts = [
-        recognizer.recognize_box(
-            img_cw, b, padding_px=config.crop_padding_px, color_order=color_order
-        )
-        for b in cw_top_boxes
-    ]
-    cw_bot_texts = [
-        recognizer.recognize_box(
-            img_cw, b, padding_px=config.crop_padding_px, color_order=color_order
-        )
-        for b in cw_bot_boxes
-    ]
+    cw_top_texts = _recognize_box_list(
+        img_cw, cw_top_boxes, recognizer=recognizer, config=config, color_order=color_order
+    )
+    cw_bot_texts = _recognize_box_list(
+        img_cw, cw_bot_boxes, recognizer=recognizer, config=config, color_order=color_order
+    )
     score_cw = score_landscape_orientation_texts(
         cw_top_texts, bottom_texts=cw_bot_texts
     )
@@ -2072,6 +2303,44 @@ def detect_and_fix_orientation(
     return winning_img, True, winning_angle, winning_boxes
 
 
+def _use_batched_recognizer(recognizer: Any) -> bool:
+    """Return True when `recognizer` is a real `VietOcrRecognizer` without a patched `recognize_box`."""
+    return (
+        isinstance(recognizer, VietOcrRecognizer)
+        and "recognize_box" not in getattr(recognizer, "__dict__", {})
+    )
+
+
+def _recognize_box_list(
+    image: np.ndarray,
+    boxes: Sequence[TextBox],
+    *,
+    recognizer: VietOcrRecognizer,
+    config: OcrLayoutConfig,
+    color_order: Literal["RGB", "BGR"] = "RGB",
+) -> list[str]:
+    """Recognize a sequence of boxes using batch mode when supported, else per-box."""
+    if not boxes:
+        return []
+    if _use_batched_recognizer(recognizer):
+        return recognizer.recognize_boxes(
+            image,
+            boxes,
+            padding_px=config.crop_padding_px,
+            color_order=color_order,
+            batch_size=config.vietocr_batch_size,
+        )
+    return [
+        recognizer.recognize_box(
+            image,
+            box,
+            padding_px=config.crop_padding_px,
+            color_order=color_order,
+        )
+        for box in boxes
+    ]
+
+
 def _recognize_lines_sequentially(
     image: np.ndarray,
     lines_of_boxes: Sequence[Sequence[TextBox]],
@@ -2080,18 +2349,26 @@ def _recognize_lines_sequentially(
     *,
     color_order: Literal["RGB", "BGR"] = "RGB",
 ) -> list[list[TextBox]]:
-    """Run VietOCR strictly sequentially on each box in every detected line."""
+    """Run VietOCR across all line boxes (batched on real `VietOcrRecognizer`, per-box on mocks)."""
+    flat_boxes = [box for line in lines_of_boxes for box in line]
+    if not flat_boxes:
+        return [[] for _ in lines_of_boxes]
+
+    texts = _recognize_box_list(
+        image,
+        flat_boxes,
+        recognizer=recognizer,
+        config=config,
+        color_order=color_order,
+    )
+
     recognized_lines: list[list[TextBox]] = []
+    idx = 0
     for line in lines_of_boxes:
         out_line: list[TextBox] = []
         for box in line:
-            text = recognizer.recognize_box(
-                image,
-                box,
-                padding_px=config.crop_padding_px,
-                color_order=color_order,
-            )
-            out_line.append(box.model_copy(update={"text": text}))
+            out_line.append(box.model_copy(update={"text": texts[idx]}))
+            idx += 1
         recognized_lines.append(out_line)
     return recognized_lines
 
@@ -2120,6 +2397,8 @@ class LocalOcrLayoutAnalyzer:
             self._recognizer = VietOcrRecognizer(
                 config_name=self.config.vietocr_config_name,
                 device=self.config.vietocr_device,
+                batch_size=self.config.vietocr_batch_size,
+                use_fp16=self.config.vietocr_use_fp16,
                 weights=self.config.vietocr_weights,
             )
         return self._recognizer
